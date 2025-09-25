@@ -19,11 +19,27 @@ st.set_page_config(
     layout="wide"
 )
 
-def authenticate_google_sheets(credentials_path):
-    """Authenticate with Google Sheets"""
+def authenticate_google_sheets():
+    """Authenticate with Google Sheets using Streamlit secrets"""
     try:
+        # Use Streamlit secrets for credentials
+        if "gcp_service_account" in st.secrets:
+            # Use secrets from Streamlit Cloud
+            credentials_info = dict(st.secrets["gcp_service_account"])
+        else:
+            # Fallback to local JSON file for development
+            credentials_path = "/Users/timofeynikulin/data-culture-12ca9f5d6c82.json"
+            if not os.path.exists(credentials_path):
+                st.error(f"❌ Файл учетных данных Google Sheets не найден по пути {credentials_path}")
+                st.error("💡 Для развертывания в Streamlit Cloud настройте секреты в разделе 'Secrets'")
+                return None
+            
+            with open(credentials_path, 'r') as f:
+                import json
+                credentials_info = json.load(f)
+        
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = Credentials.from_service_account_file(credentials_path, scopes=scope)
+        creds = Credentials.from_service_account_info(credentials_info, scopes=scope)
         client = gspread.authorize(creds)
         return client
     except Exception as e:
@@ -148,21 +164,69 @@ def extract_course_data(uploaded_file, course_name):
         possible_completion_names = ['Процент завершения', 'Completion', 'Progress', 'Прогресс', 'Завершение']
         
         # Also check if we need to calculate completion from multiple columns
-        # Look for columns that might contain "Выполнено" values to calculate percentage
+        # Look for columns that might contain completion data
         completed_columns = []
+        timestamp_columns = []
+        
         for col in df.columns:
             if col not in ['Unnamed: 0', email_column, 'Данные о пользователе', 'User information', 'Страна']:
                 # Check if this column contains completion data
                 if not col.startswith('Unnamed:') and len(str(col).strip()) > 0:
-                    # Sample some values to see if they contain "Выполнено" or "Не выполнено"
+                    # Sample some values to see if they contain "Выполнено" или "Не выполнено"
                     sample_values = df[col].dropna().astype(str).head(100)
                     if any('Выполнено' in str(val) or 'выполнено' in str(val).lower() for val in sample_values):
                         # Skip informational columns (based on experience memory)
                         if not all(str(val) == 'Не выполнено' for val in sample_values if pd.notna(val)):
                             completed_columns.append(col)
+                elif col.startswith('Unnamed:') and col != 'Unnamed: 0':
+                    # Check if this unnamed column contains timestamps (completion indicators)
+                    sample_values = df[col].dropna().astype(str).head(20)
+                    for val in sample_values:
+                        val_str = str(val).strip()
+                        # Check if it looks like a timestamp
+                        if any(pattern in val_str for pattern in ['2020', '2021', '2022', '2023', '2024']) and ':' in val_str:
+                            timestamp_columns.append(col)
+                            break
+        
+        # If we found timestamp columns, use them for completion calculation
+        if timestamp_columns:
+            st.info(f"Найдено {len(timestamp_columns)} столбцов с временными метками для курса {course_name}")
+            
+            # Calculate completion percentage based on timestamps
+            completion_data = []
+            for idx, row in df.iterrows():
+                email_val = row[email_column]
+                if pd.isna(email_val) or '@edu.hse.ru' not in str(email_val).lower():
+                    continue
+                
+                total_tasks = len(timestamp_columns)
+                completed_tasks = 0
+                
+                for col in timestamp_columns:
+                    cell_val = row[col]
+                    val_str = str(cell_val).strip() if not pd.isna(cell_val) else ''
+                    # Check if there's a valid timestamp (indicates completion)
+                    if val_str and val_str != 'nan' and val_str != '':
+                        # Verify it looks like a timestamp
+                        if any(pattern in val_str for pattern in ['2020', '2021', '2022', '2023', '2024']) and ':' in val_str:
+                            completed_tasks += 1
+                
+                # Calculate percentage
+                percentage = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
+                completion_data.append({'email': str(email_val).lower().strip(), 'percentage': percentage})
+            
+            # Create result DataFrame
+            if completion_data:
+                result_df = pd.DataFrame(completion_data)
+                result_df.columns = ['Корпоративная почта', f'Процент_{course_name}']
+                st.success(f"✅ Рассчитан процент завершения для {len(result_df)} студентов курса {course_name} на основе {len(timestamp_columns)} заданий")
+                return result_df
+            else:
+                st.warning(f"Не найдено данных о завершении для курса {course_name}")
+                return None
         
         # If we found completion tracking columns, calculate percentage
-        if completed_columns:
+        elif completed_columns:
             st.info(f"Найдено {len(completed_columns)} столбцов с данными о выполнении для курса {course_name}")
             
             # Calculate completion percentage
@@ -435,7 +499,7 @@ def main():
                     
                     # Step 5: Update Google Sheets
                     st.info("☁️ Обновление Google Sheets...")
-                    client = authenticate_google_sheets(credentials_path)
+                    client = authenticate_google_sheets()
                     if client is None:
                         st.stop()
                     
