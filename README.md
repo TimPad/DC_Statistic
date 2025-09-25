@@ -81,7 +81,7 @@ streamlit run streamlit_app.py
 ## ⚙️ Конфигурация
 При необходимости обновите путь к учетным данным в `streamlit_app.py`:
 ```python
-credentials_path = "/Users/timofeynikulin/data-culture-12ca9f5d6c82.json"
+credentials_path
 ```
 
 ## 🐛 Устранение неполадок
