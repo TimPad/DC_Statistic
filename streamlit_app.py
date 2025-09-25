@@ -24,10 +24,22 @@ def get_gcp_credentials():
     Загружает GCP credentials только из secrets.toml
     """
     if "gcp_service_account" in st.secrets:
-        credentials_info = st.secrets["gcp_service_account"]  # уже dict
+        credentials_info = st.secrets["gcp_service_account"]
         return service_account.Credentials.from_service_account_info(credentials_info)
     else:
         raise RuntimeError("❌ Нет секрета [gcp_service_account] в .streamlit/secrets.toml")
+
+def authenticate_google_sheets():
+    """
+    Авторизация и возврат клиента gspread
+    """
+    try:
+        creds = get_gcp_credentials()
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
+        st.error(f"Ошибка аутентификации в Google Sheets: {str(e)}")
+        return None
 
 def load_student_list(uploaded_file):
     """Load student list from uploaded Excel or CSV file"""
@@ -355,12 +367,6 @@ def main():
     # Sidebar for file uploads
     st.sidebar.header("📁 Загрузка файлов")
     
-    # Check for credentials file
-    credentials_path = "/Users/timofeynikulin/data-culture-12ca9f5d6c82.json"
-    if not os.path.exists(credentials_path):
-        st.error(f"❌ Файл учетных данных Google Sheets не найден по пути {credentials_path}")
-        st.stop()
-    
     # File upload widgets
     student_file = st.sidebar.file_uploader(
         "Загрузить список студентов (Excel/CSV)",
@@ -393,7 +399,7 @@ def main():
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.header("📋 Processing Status")
+        st.header("📋 Статус обработки")
         
         # Check if all files are uploaded
         files_uploaded = all([
@@ -420,17 +426,12 @@ def main():
                 "Курс Анализ данных": "✅" if course_analysis_file else "❌"
             }
             
-            # Create DataFrame with proper structure
-            status_data = []
-            for file_name, status in file_status.items():
-                status_data.append({"Файл": file_name, "Статус": status})
-            status_df = pd.DataFrame(status_data)
+            status_df = pd.DataFrame([{"Файл": k, "Статус": v} for k, v in file_status.items()])
             st.table(status_df)
         
         else:
             st.success("Все файлы успешно загружены! Готово к обработке.")
             
-            # Process button
             if st.button("🚀 Начать обработку", type="primary"):
                 
                 with st.spinner("Обработка данных..."):
