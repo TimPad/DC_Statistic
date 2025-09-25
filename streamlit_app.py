@@ -26,17 +26,49 @@ def authenticate_google_sheets():
         if "gcp_service_account" in st.secrets:
             # Use secrets from Streamlit Cloud
             credentials_info = dict(st.secrets["gcp_service_account"])
+            
+            # Handle private key format - convert \n to actual line breaks if needed
+            if 'private_key' in credentials_info:
+                private_key = credentials_info['private_key']
+                if '\\n' in private_key:
+                    # Replace literal \n with actual line breaks
+                    credentials_info['private_key'] = private_key.replace('\\n', '\n')
+                elif '\n' in private_key and not private_key.startswith('-----BEGIN'):
+                    # Handle case where \n is already properly formatted but needs conversion
+                    credentials_info['private_key'] = private_key.replace('\n', '\n')
+            
+            st.success("✅ Используются секреты Streamlit Cloud")
         else:
             # Fallback to local JSON file for development
-            credentials_path = "/Users/timofeynikulin/data-culture-12ca9f5d6c82.json"
-            if not os.path.exists(credentials_path):
-                st.error(f"❌ Файл учетных данных Google Sheets не найден по пути {credentials_path}")
+            # Try multiple possible credential file names
+            possible_paths = [
+                "/Users/timofeynikulin/data-culture-12ca9f5d6c82.json",
+                "/Users/timofeynikulin/Обработка учебника по питону/data-culture-12ca9f5d6c82.json",
+                "/Users/timofeynikulin/Обработка учебника по питону/data-culture-12ca9f5d6c82 — копия.json",
+                "./data-culture-12ca9f5d6c82.json",
+                "./data-culture-12ca9f5d6c82 — копия.json"
+            ]
+            
+            credentials_path = None
+            for path in possible_paths:
+                if os.path.exists(path):
+                    credentials_path = path
+                    break
+            
+            if credentials_path is None:
+                st.error("❌ Файл учетных данных Google Sheets не найден")
+                st.error("🔍 Проверенные пути:")
+                for path in possible_paths:
+                    st.error(f"   • {path}")
+                st.error("")
                 st.error("💡 Для развертывания в Streamlit Cloud настройте секреты в разделе 'Secrets'")
+                st.error("📖 Подробная инструкция: STREAMLIT_CLOUD_DEPLOYMENT.md")
                 return None
             
             with open(credentials_path, 'r') as f:
                 import json
                 credentials_info = json.load(f)
+                st.success(f"✅ Используются локальные учетные данные: {os.path.basename(credentials_path)}")
         
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
         creds = Credentials.from_service_account_info(credentials_info, scopes=scope)
