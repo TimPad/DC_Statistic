@@ -21,29 +21,13 @@ st.set_page_config(
 
 def get_gcp_credentials():
     """
-    Загружает GCP credentials:
-    - Если запущено в Streamlit Cloud → берет из st.secrets["gcp_service_account"]
-    - Если локально → берет из переменной окружения GOOGLE_APPLICATION_CREDENTIALS
-      (файл JSON ключа сервисного аккаунта)
+    Загружает GCP credentials только из secrets.toml
     """
     if "gcp_service_account" in st.secrets:
-        # ✅ в st.secrets это уже dict, т.к. в secrets.toml блок [gcp_service_account]
-        credentials_info = st.secrets["gcp_service_account"]
+        credentials_info = st.secrets["gcp_service_account"]  # уже dict
         return service_account.Credentials.from_service_account_info(credentials_info)
-    
-    # 🔄 fallback для локального запуска
-    elif "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
-        credentials_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
-        with open(credentials_path, "r") as f:
-            credentials_info = json.load(f)
-        return service_account.Credentials.from_service_account_info(credentials_info)
-    
     else:
-        raise RuntimeError(
-            "❌ Не найден GCP сервисный аккаунт. "
-            "Добавь [gcp_service_account] в .streamlit/secrets.toml или "
-            "установи GOOGLE_APPLICATION_CREDENTIALS"
-        )
+        raise RuntimeError("❌ Нет секрета [gcp_service_account] в .streamlit/secrets.toml")
 
 def load_student_list(uploaded_file):
     """Load student list from uploaded Excel or CSV file"""
