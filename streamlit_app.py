@@ -11,6 +11,7 @@ import os
 import tempfile
 import time
 from io import StringIO
+from google.oauth2 import service_account
 
 # Page configuration
 st.set_page_config(
