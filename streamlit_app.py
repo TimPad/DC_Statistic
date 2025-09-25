@@ -23,7 +23,7 @@ def authenticate_google_sheets():
     """Authenticate with Google Sheets using Streamlit secrets"""
     try:
         # Use Streamlit secrets for credentials
-        if "gcp_service_account" in st.secrets:
+        if hasattr(st, 'secrets') and "gcp_service_account" in st.secrets:
             # Use secrets from Streamlit Cloud
             credentials_info = dict(st.secrets["gcp_service_account"])
             
