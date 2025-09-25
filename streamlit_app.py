@@ -19,64 +19,31 @@ st.set_page_config(
     layout="wide"
 )
 
-def authenticate_google_sheets():
-    """Authenticate with Google Sheets using Streamlit secrets"""
-    try:
-        # Use Streamlit secrets for credentials
-        if hasattr(st, 'secrets') and "gcp_service_account" in st.secrets:
-            # Use secrets from Streamlit Cloud
-            credentials_info = dict(st.secrets["gcp_service_account"])
-            
-            # Handle private key format - convert \n to actual line breaks if needed
-            if 'private_key' in credentials_info:
-                private_key = credentials_info['private_key']
-                if '\\n' in private_key:
-                    # Replace literal \n with actual line breaks
-                    credentials_info['private_key'] = private_key.replace('\\n', '\n')
-                elif '\n' in private_key and not private_key.startswith('-----BEGIN'):
-                    # Handle case where \n is already properly formatted but needs conversion
-                    credentials_info['private_key'] = private_key.replace('\n', '\n')
-            
-            st.success("✅ Используются секреты Streamlit Cloud")
-        else:
-            # Fallback to local JSON file for development
-            # Try multiple possible credential file names
-            possible_paths = [
-                "/Users/timofeynikulin/data-culture-12ca9f5d6c82.json",
-                "/Users/timofeynikulin/Обработка учебника по питону/data-culture-12ca9f5d6c82.json",
-                "/Users/timofeynikulin/Обработка учебника по питону/data-culture-12ca9f5d6c82 — копия.json",
-                "./data-culture-12ca9f5d6c82.json",
-                "./data-culture-12ca9f5d6c82 — копия.json"
-            ]
-            
-            credentials_path = None
-            for path in possible_paths:
-                if os.path.exists(path):
-                    credentials_path = path
-                    break
-            
-            if credentials_path is None:
-                st.error("❌ Файл учетных данных Google Sheets не найден")
-                st.error("🔍 Проверенные пути:")
-                for path in possible_paths:
-                    st.error(f"   • {path}")
-                st.error("")
-                st.error("💡 Для развертывания в Streamlit Cloud настройте секреты в разделе 'Secrets'")
-                st.error("📖 Подробная инструкция: STREAMLIT_CLOUD_DEPLOYMENT.md")
-                return None
-            
-            with open(credentials_path, 'r') as f:
-                import json
-                credentials_info = json.load(f)
-                st.success(f"✅ Используются локальные учетные данные: {os.path.basename(credentials_path)}")
-        
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = Credentials.from_service_account_info(credentials_info, scopes=scope)
-        client = gspread.authorize(creds)
-        return client
-    except Exception as e:
-        st.error(f"Ошибка аутентификации Google Sheets: {str(e)}")
-        return None
+def get_gcp_credentials():
+    """
+    Загружает GCP credentials:
+    - Если запущено в Streamlit Cloud → берет из st.secrets["gcp_service_account"]
+    - Если локально → берет из переменной окружения GOOGLE_APPLICATION_CREDENTIALS
+      (файл JSON ключа сервисного аккаунта)
+    """
+    if "gcp_service_account" in st.secrets:
+        # ✅ в st.secrets это уже dict, т.к. в secrets.toml блок [gcp_service_account]
+        credentials_info = st.secrets["gcp_service_account"]
+        return service_account.Credentials.from_service_account_info(credentials_info)
+    
+    # 🔄 fallback для локального запуска
+    elif "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
+        credentials_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+        with open(credentials_path, "r") as f:
+            credentials_info = json.load(f)
+        return service_account.Credentials.from_service_account_info(credentials_info)
+    
+    else:
+        raise RuntimeError(
+            "❌ Не найден GCP сервисный аккаунт. "
+            "Добавь [gcp_service_account] в .streamlit/secrets.toml или "
+            "установи GOOGLE_APPLICATION_CREDENTIALS"
+        )
 
 def load_student_list(uploaded_file):
     """Load student list from uploaded Excel or CSV file"""
