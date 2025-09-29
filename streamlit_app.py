@@ -11,7 +11,6 @@ import os
 import tempfile
 import time
 from io import StringIO
-from google.oauth2 import service_account
 
 # Page configuration
 st.set_page_config(
@@ -20,27 +19,90 @@ st.set_page_config(
     layout="wide"
 )
 
-def get_gcp_credentials():
-    """
-    Загружает GCP credentials только из secrets.toml
-    """
-    if "gcp_service_account" in st.secrets:
-        credentials_info = st.secrets["gcp_service_account"]
-        return service_account.Credentials.from_service_account_info(credentials_info)
-    else:
-        raise RuntimeError("❌ Нет секрета [gcp_service_account] в .streamlit/secrets.toml")
-
 def authenticate_google_sheets():
-    """
-    Авторизация и возврат клиента gspread
-    """
+    """Аутентификация с Google Sheets используя только Streamlit secrets"""
     try:
-        creds = get_gcp_credentials()
+        # Проверяем наличие секретов
+        if not hasattr(st, 'secrets') or "gcp_service_account" not in st.secrets:
+            st.error("❌ Секреты GCP не найдены в конфигурации Streamlit")
+            st.error("💡 Для развертывания в Streamlit Cloud настройте секреты в разделе 'Secrets'")
+            st.error("📖 Подробная инструкция: STREAMLIT_CLOUD_DEPLOYMENT.md")
+            return None
+        
+        # Используем секреты из Streamlit Cloud
+        credentials_info = dict(st.secrets["gcp_service_account"])
+        
+        # Обработка формата private key - конвертация \n в реальные переносы строк
+        if 'private_key' in credentials_info:
+            private_key = credentials_info['private_key']
+            if '\\n' in private_key:
+                # Заменяем литеральные \n на реальные переносы строк
+                credentials_info['private_key'] = private_key.replace('\\n', '\n')
+            elif '\n' in private_key and not private_key.startswith('-----BEGIN'):
+                # Обрабатываем случай, когда \n уже правильно отформатирован
+                credentials_info['private_key'] = private_key.replace('\n', '\n')
+        
+        # Создаем клиента Google Sheets
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = Credentials.from_service_account_info(credentials_info, scopes=scope)
         client = gspread.authorize(creds)
+        
+        st.success("✅ Аутентификация Google Sheets успешна (секреты Streamlit)")
         return client
+        
     except Exception as e:
-        st.error(f"Ошибка аутентификации в Google Sheets: {str(e)}")
+        st.error(f"❌ Ошибка аутентификации Google Sheets: {str(e)}")
         return None
+
+def check_google_sheets_connection(client):
+    """Проверка подключения к Google Sheets"""
+    try:
+        if client is None:
+            st.error("❌ Клиент Google Sheets не инициализирован")
+            return False
+        
+        # Попытка открыть таблицу DC_stat
+        st.info("🔍 Проверка подключения к Google Sheets...")
+        
+        try:
+            spreadsheet = client.open('DC_stat')
+            st.success(f"✅ Таблица 'DC_stat' найдена. ID: {spreadsheet.id}")
+        except gspread.SpreadsheetNotFound:
+            st.error("❌ Таблица 'DC_stat' не найдена или нет доступа")
+            st.error("💡 Убедитесь, что таблица существует и открыт доступ для service account")
+            return False
+        
+        try:
+            worksheet = spreadsheet.worksheet('Лист1')
+            st.success(f"✅ Лист 'Лист1' доступен. Размер: {worksheet.row_count}x{worksheet.col_count}")
+        except gspread.WorksheetNotFound:
+            st.error("❌ Лист 'Лист1' не найден")
+            st.error("💡 Проверьте название листа в Google Sheets")
+            return False
+        
+        # Проверка прав на запись
+        try:
+            # Попытка получить данные из первой ячейки
+            test_cell = worksheet.acell('A1')
+            st.success(f"✅ Права на чтение подтверждены (A1: '{test_cell.value}')")
+            
+            # Проверка прав на запись (тестовая запись)
+            import datetime
+            test_value = f"Тест подключения {datetime.datetime.now().strftime('%H:%M:%S')}"
+            # Используем правильный формат для API - передаем значение как список
+            worksheet.update('Z1', [[test_value]])
+            st.success("✅ Права на запись подтверждены")
+            
+        except Exception as e:
+            st.error(f"❌ Ошибка проверки прав доступа: {str(e)}")
+            return False
+        
+        st.success("🎉 Подключение к Google Sheets полностью работоспособно!")
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Общая ошибка проверки подключения: {str(e)}")
+        return False
 
 def load_student_list(uploaded_file):
     """Load student list from uploaded Excel or CSV file"""
@@ -437,6 +499,22 @@ def main():
                 
                 with st.spinner("Обработка данных..."):
                     
+                    # Step 0: Проверка подключения к Google Sheets
+                    st.info("🔍 Проверка подключения к Google Sheets...")
+                    client = authenticate_google_sheets()
+                    if client is None:
+                        st.error("❌ Не удалось установить подключение к Google Sheets")
+                        st.error("💡 Проверьте конфигурацию секретов и повторите попытку")
+                        st.stop()
+                    
+                    # Проверяем работоспособность подключения
+                    if not check_google_sheets_connection(client):
+                        st.error("❌ Подключение к Google Sheets не работает")
+                        st.error("💡 Устраните проблемы с доступом и повторите попытку")
+                        st.stop()
+                    
+                    st.success("✅ Подключение к Google Sheets проверено и работает")
+                    
                     # Step 1: Load student list
                     st.info("📚 Загрузка списка студентов...")
                     student_list = load_student_list(student_file)
@@ -484,9 +562,7 @@ def main():
                     
                     # Step 5: Update Google Sheets
                     st.info("☁️ Обновление Google Sheets...")
-                    client = authenticate_google_sheets()
-                    if client is None:
-                        st.stop()
+                    # Используем уже проверенный клиент
                     
                     success = upload_to_google_sheets(client, consolidated_data)
                     if success:
@@ -497,6 +573,15 @@ def main():
     
     with col2:
         st.header("ℹ️ Информация")
+        
+        # Кнопка проверки подключения
+        st.subheader("🔍 Проверка подключения")
+        if st.button("🔍 Проверить Google Sheets", type="secondary"):
+            client = authenticate_google_sheets()
+            if client:
+                check_google_sheets_connection(client)
+        
+        st.markdown("---")
         st.markdown("""
         **Системные требования:**
         - Список студентов в формате Excel (.xlsx, .xls) или CSV (.csv)
@@ -529,3 +614,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
