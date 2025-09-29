@@ -305,12 +305,8 @@ def merge_student_and_course_data(student_df, progress_df):
             result_df = pd.merge(student_df, progress_df, left_on='Корпоративная почта', right_on='Email', how='left')
             # Remove duplicate Email column
             result_df = result_df.drop('Email', axis=1)
-            # Fill NaN values with zeros
-            progress_columns = ['Завершено активностей', 'Попыток выполнения', 'Не начато активностей', 
-                              'Всего активностей', 'Процент завершения', 'Процент попыток']
-            for col in progress_columns:
-                if col in result_df.columns:
-                    result_df[col] = result_df[col].fillna(0)
+            # Keep NaN values for students not found in course statistics instead of filling with zeros
+            # This preserves the information that students were not present in the course data
         else:
             # If no progress data, add empty columns
             result_df = student_df.copy()
