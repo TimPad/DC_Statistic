@@ -1,427 +1,243 @@
 """
-Simple course processor for Google Sheets integration
+Consolidate course data from three textbooks into a single dataset with percentage columns
 """
 
 import pandas as pd
-import io
-import re
-import sys
-import os
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import json
+from google.oauth2.service_account import Credentials
+import os
 
-def load_excel_student_data(file_path):
-    """Load student data from Excel file"""
-    try:
-        df = pd.read_excel(file_path)
-        
-        # Map columns to required format
-        required_columns = {
-            'ФИО': ['фио', 'фio', 'имя', 'name'],
-            'Корпоративная почта': ['корпоративная почта', 'email', 'почта', 'e-mail'],
-            'Филиал (кампус)': ['филиал', 'кампус', 'campus'],
-            'Факультет': ['факультет', 'faculty'],
-            'Образовательная программа': ['образовательная программа', 'программа', 'educational program'],
-            'Группа': ['группа', 'group'],
-            'Курс': ['курс', 'course']
-        }
-        
-        # Find matching columns in the file
-        found_columns = {}
-        df_columns_lower = [col.lower().strip() for col in df.columns]
-        
-        for target_col, possible_names in required_columns.items():
-            for col_idx, col_name in enumerate(df_columns_lower):
-                if any(possible_name in col_name for possible_name in possible_names):
-                    found_columns[target_col] = df.columns[col_idx]
-                    break
-        
-        # Create new DataFrame with required columns
-        result_df = pd.DataFrame()
-        for target_col, source_col in found_columns.items():
-            result_df[target_col] = df[source_col]
-        
-        # Add missing columns with empty values
-        for required_col in required_columns.keys():
-            if required_col not in result_df.columns:
-                result_df[required_col] = ''
-        
-        # Filter only students with edu.hse.ru email
-        result_df = result_df[result_df['Корпоративная почта'].astype(str).str.contains('@edu.hse.ru', na=False)]
-        result_df['Корпоративная почта'] = result_df['Корпоративная почта'].astype(str).str.lower().str.strip()
-        
-        print(f"Loaded {len(result_df)} records from Excel file")
-        return result_df
-    except Exception as e:
-        print(f"Error loading Excel file: {str(e)}")
-        return None
+def load_student_list(file_path):
+    """Load student list from Excel file"""
+    print("Loading student list...")
+    df = pd.read_excel(file_path)
+    
+    # Map columns to required format
+    required_columns = {
+        'ФИО': ['фио', 'фio', 'имя', 'name'],
+        'Корпоративная почта': ['корпоративная почта', 'email', 'почта', 'e-mail'],
+        'Филиал (кампус)': ['филиал', 'кампус', 'campus'],
+        'Факультет': ['факультет', 'faculty'],
+        'Образовательная программа': ['образовательная программа', 'программа', 'educational program'],
+        'Группа': ['группа', 'group'],
+        'Курс': ['курс', 'course']
+    }
+    
+    # Find matching columns in the file
+    found_columns = {}
+    df_columns_lower = [str(col).lower().strip() for col in df.columns]
+    
+    for target_col, possible_names in required_columns.items():
+        for col_idx, col_name in enumerate(df_columns_lower):
+            if any(possible_name in col_name for possible_name in possible_names):
+                found_columns[target_col] = df.columns[col_idx]
+                break
+    
+    # Create new DataFrame with required columns
+    result_df = pd.DataFrame()
+    for target_col, source_col in found_columns.items():
+        result_df[target_col] = df[source_col]
+    
+    # Add missing columns with empty values
+    for required_col in required_columns.keys():
+        if required_col not in result_df.columns:
+            result_df[required_col] = ''
+    
+    # Filter only students with edu.hse.ru email
+    result_df = result_df[result_df['Корпоративная почта'].astype(str).str.contains('@edu.hse.ru', na=False)]
+    # Convert to string before using str accessor
+    result_df['Корпоративная почта'] = pd.Series(result_df['Корпоративная почта']).astype(str).str.lower().str.strip()
+    
+    print(f"Loaded {len(result_df)} student records")
+    return result_df
 
-def load_csv_course_data(file_path):
-    """Load and analyze course data from CSV file"""
-    try:
-        # Try different encodings
-        try:
-            # Try UTF-16 with tabulation (as in your files)
-            with open(file_path, 'rb') as f:
-                content = f.read()
-            df = pd.read_csv(io.StringIO(content.decode('utf-16')), sep='\t', low_memory=False)
-        except:
-            try:
-                # Try UTF-8 with comma
-                df = pd.read_csv(file_path, sep=',', low_memory=False)
-            except:
-                # Try UTF-8 with semicolon
-                df = pd.read_csv(file_path, sep=';', low_memory=False)
-        
-        print(f"Course CSV file loaded. Number of records: {len(df)}")
-        return df
-    except Exception as e:
-        print(f"Error loading CSV file: {str(e)}")
-        return None
+def extract_course_data(file_path, course_name):
+    """Extract email and completion percentage from course analytics file"""
+    print(f"Processing {course_name} course data...")
+    df = pd.read_csv(file_path)
+    
+    # Extract the specific columns we need
+    course_data = df[['Корпоративная почта', 'Процент завершения']].copy()
+    course_data.columns = ['Корпоративная почта', f'Процент_{course_name}']
+    # Convert to string before using str accessor
+    course_data['Корпоративная почта'] = pd.Series(course_data['Корпоративная почта']).astype(str).str.lower().str.strip()
+    
+    print(f"Extracted {len(course_data)} records for {course_name}")
+    return course_data
 
-def process_course_analytics(course_df):
-    """Process course analytics from loaded data"""
-    try:
-        # Extract student information
-        students_data = []
-        
-        # Find active students (exclude header rows)
-        for idx, row in course_df.iterrows():
-            # Get name from first column
-            student_name = str(row[course_df.columns[0]]).strip()
-            
-            # Skip header rows
-            if '-----' in student_name or student_name == 'nan' or not student_name:
-                continue
-                
-            # Skip rows with positions
-            if any(title in student_name.lower() for title in ['профессор', 'доцент', 'штатная', 'преподаватель', 'научный']):
-                continue
-            
-            # Get user data
-            user_data = str(row.get('Данные о пользователе', '')).strip()
-            if not user_data or user_data == 'nan':
-                continue
-                
-            # Get email
-            email = str(row.get('Адрес электронной почты', '')).strip()
-            
-            # Add email domain check - keep only @edu.hse.ru records
-            if not email or '@edu.hse.ru' not in email:
-                continue
-                
-            # Also check that email doesn't contain words like "professor", "staff", etc.
-            if any(title in email.lower() for title in ['professor', 'staff', 'admin', 'support']):
-                continue
-            
-            # Check that email looks like a real student email
-            if not re.match(r'^[a-zA-Z0-9._-]+@edu\.hse\.ru$', email):
-                continue
-            
-            # Check that name doesn't contain service words
-            if any(title in student_name.lower() for title in ['manager', 'admin', 'support', 'test']):
-                continue
-            
-            # Check that user data doesn't contain service records
-            if any(title in user_data.lower() for title in ['manager', 'admin', 'support', 'test']):
-                continue
-            
-            # Check that user data contains faculty information
-            if 'факультет' not in user_data.lower() and 'школа' not in user_data.lower() and 'институт' not in user_data.lower():
-                continue
-                
-            # Split user data by semicolon
-            parts = user_data.split(';')
-            
-            # Extract information
-            faculty = ''
-            program = ''
-            course = ''
-            group = ''
-            
-            if len(parts) > 0:
-                faculty = parts[0].strip()
-            
-            if len(parts) > 1:
-                program_part = parts[1].strip()
-                # Clean program from codes
-                program = re.sub(r'^[БМ]\s*\d+\.\d+\.\d+\s*[^;]*?\s*\d{4}\s*очная\s*', '', program_part).strip()
-            
-            if len(parts) > 2:
-                course_part = parts[2].strip()
-                # Extract course number
-                course_match = re.search(r'(\d+)', course_part)
-                if course_match:
-                    course = course_match.group(1)
-            
-            if len(parts) > 3:
-                group = parts[3].strip()
-                # If fourth element is empty, try the last one
-                if not group and len(parts) > 1:
-                    group = parts[-1].strip()
-            
-            # Convert to lowercase for consistency
-            faculty = faculty.lower()
-            program = program.lower()
-            group = group.lower()
-            
-            # Skip rows with positions in user data
-            if any(title in faculty for title in ['профессор', 'доцент', 'штатная', 'преподаватель', 'научный', 'manager', 'admin']):
-                continue
-                
-            # Check that faculty contains meaningful value
-            if not faculty or len(faculty) < 5:
-                continue
-                
-            students_data.append({
-                'ФИО': student_name,
-                'Email': email.lower().strip(),
-                'Факультет': faculty,
-                'Образовательная программа': program,
-                'Курс': course,
-                'Группа': group
-            })
-        
-        # Create DataFrame
-        students_df = pd.DataFrame(students_data)
-        print(f"Extracted student data: {len(students_df)} records")
-        
-        # Identify real activities
-        potential_activity_columns = []
-        for col in course_df.columns:
-            col_str = str(col).lower()
-            if any(keyword in col_str for keyword in [
-                'задач', 'тест', 'видео', 'блокнот', 'упражнен', 'практик'
-            ]):
-                potential_activity_columns.append(col)
-        
-        # Filter real activities (only with "Выполнено"/"Не выполнено")
-        real_activity_columns = []
-        for col in potential_activity_columns:
-            try:
-                unique_values = course_df[col].dropna().unique()
-                # Real activity should have exactly 2 values: "Выполнено" and "Не выполнено"
-                if len(unique_values) == 2:
-                    values_str = [str(v).lower().strip() for v in unique_values]
-                    if 'выполнено' in values_str and 'не выполнено' in values_str:
-                        real_activity_columns.append(col)
-            except Exception:
-                continue
-        
-        print(f"Found real activities: {len(real_activity_columns)}")
-        
-        # Create student mapping dictionary
-        student_mapping = {}
-        for idx, row in students_df.iterrows():
-            email = row['Email'].lower().strip()
-            if email:
-                student_mapping[email] = idx
-        
-        # Analyze progress for each student
-        progress_data = []
-        
-        for idx, row in course_df.iterrows():
-            # Get name from first column
-            student_name = str(row[course_df.columns[0]]).strip()
-            
-            # Skip header rows
-            if '-----' in student_name or student_name == 'nan' or not student_name:
-                continue
-                
-            # Skip rows with positions
-            if any(title in student_name.lower() for title in ['профессор', 'доцент', 'штатная', 'преподаватель', 'научный']):
-                continue
-            
-            email = str(row.get('Адрес электронной почты', '')).strip().lower()
-            
-            # Add email domain check - keep only @edu.hse.ru records
-            if not email or '@edu.hse.ru' not in email:
-                continue
-                
-            # Also check that email doesn't contain words like "professor", "staff", etc.
-            if any(title in email.lower() for title in ['professor', 'staff', 'admin', 'support']):
-                continue
-            
-            # Check that email looks like a real student email
-            if not re.match(r'^[a-zA-Z0-9._-]+@edu\.hse\.ru$', email):
-                continue
-            
-            # Check if student exists in our data
-            if email in student_mapping:
-                student_idx = student_mapping[email]
-                student_info = students_df.iloc[student_idx]
-                
-                # Count progress
-                completed = 0
-                attempted = 0
-                not_started = 0
-                
-                for activity_col in real_activity_columns:
-                    activity_value = row.get(activity_col, None)
-                    
-                    if pd.notna(activity_value) and str(activity_value).strip():
-                        activity_str = str(activity_value).strip().lower()
-                        
-                        if activity_str == 'выполнено':
-                            completed += 1
-                            attempted += 1
-                        elif activity_str == 'не выполнено':
-                            attempted += 1
-                        else:
-                            not_started += 1
-                    else:
-                        not_started += 1
-                
-                total_activities = len(real_activity_columns)
-                completion_rate = (completed / total_activities * 100) if total_activities > 0 else 0
-                attempt_rate = (attempted / total_activities * 100) if total_activities > 0 else 0
-                
-                progress_data.append({
-                    'Email': student_info['Email'],
-                    'Завершено активностей': completed,
-                    'Попыток выполнения': attempted,
-                    'Не начато активностей': not_started,
-                    'Всего активностей': total_activities,
-                    'Процент завершения': round(completion_rate, 2),
-                    'Процент попыток': round(attempt_rate, 2)
-                })
-        
-        # Create DataFrame with progress
-        progress_df = pd.DataFrame(progress_data)
-        print(f"Analyzed student progress: {len(progress_df)} records")
-        
-        return progress_df
-        
-    except Exception as e:
-        print(f"Error processing course analytics: {str(e)}")
-        return None
-
-def merge_student_and_course_data(student_df, progress_df):
-    """Merge student data and course analytics"""
-    try:
-        # Merge by email
-        if progress_df is not None and not progress_df.empty:
-            result_df = pd.merge(student_df, progress_df, left_on='Корпоративная почта', right_on='Email', how='left')
-            # Remove duplicate Email column
-            result_df = result_df.drop('Email', axis=1)
-            # Keep NaN values for students not found in course statistics instead of filling with zeros
-            # This preserves the information that students were not present in the course data
-        else:
-            # If no progress data, add empty columns
-            result_df = student_df.copy()
-            result_df['Завершено активностей'] = 0
-            result_df['Попыток выполнения'] = 0
-            result_df['Не начато активностей'] = 0
-            result_df['Всего активностей'] = 0
-            result_df['Процент завершения'] = 0.0
-            result_df['Процент попыток'] = 0.0
-        
-        print(f"Data merged. Total records: {len(result_df)}")
-        return result_df
-    except Exception as e:
-        print(f"Error merging data: {str(e)}")
-        return None
+def consolidate_data(student_list, course_files):
+    """Consolidate all course data with student list"""
+    print("Consolidating data...")
+    
+    # Start with student list
+    consolidated = student_list.copy()
+    
+    # Merge each course data
+    course_names = ['ЦГ', 'Питон', 'Андан']
+    for i, (file_path, course_name) in enumerate(zip(course_files, course_names)):
+        course_data = extract_course_data(file_path, course_name)
+        consolidated = pd.merge(consolidated, course_data, on='Корпоративная почта', how='left')
+        # Keep NaN values instead of filling with 0 for missing students
+        # This preserves the information that the student was not found in course statistics
+        print(f"Merged {course_name} data (keeping NaN for missing students)")
+    
+    print(f"Consolidation complete. Total records: {len(consolidated)}")
+    return consolidated
 
 def authenticate_google_sheets(credentials_path):
     """Authenticate with Google Sheets"""
     try:
-        # Use your specific Google Sheets configuration
         scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name(credentials_path, scope)
+        creds = Credentials.from_service_account_file(credentials_path, scopes=scope)
         client = gspread.authorize(creds)
         return client
     except Exception as e:
         print(f"Google Sheets authentication error: {str(e)}")
         return None
 
-def update_google_sheet(client, data_df):
-    """Update data in Google Sheets using your specific settings"""
+def update_google_sheet_incremental(client, data_df):
+    """Update Google Sheets incrementally - only add new data or update existing"""
     try:
         # Open the Google Sheet with your specific settings
         spreadsheet = client.open('DC_stat')
         worksheet = spreadsheet.worksheet('Лист1')
         
-        # Clear existing data
-        worksheet.clear()
+        # Get existing data
+        try:
+            existing_data = worksheet.get_all_records()
+            existing_df = pd.DataFrame(existing_data)
+            print(f"Found {len(existing_df)} existing records in Google Sheets")
+        except:
+            existing_df = pd.DataFrame()
+            print("No existing data found in Google Sheets")
         
-        # Prepare data for upload
-        # Headers
-        headers = data_df.columns.tolist()
+        if existing_df.empty:
+            # If no existing data, upload all data
+            print("Uploading all data to Google Sheets...")
+            upload_data_in_batches(worksheet, data_df)
+        else:
+            # Merge with existing data
+            print("Merging with existing data...")
+            # Merge on email column
+            if 'Корпоративная почта' in existing_df.columns:
+                # Update existing records and add new ones
+                merged_df = existing_df.merge(data_df, on='Корпоративная почта', how='outer', suffixes=('_old', ''))
+                
+                # For columns that exist in both, prefer the new data
+                for col in ['ФИО', 'Филиал (кампус)', 'Факультет', 'Образовательная программа', 'Группа', 'Курс']:
+                    if f'{col}_old' in merged_df.columns and col in merged_df.columns:
+                        # Use new data if available, otherwise keep old
+                        merged_df[col] = merged_df[col].fillna(merged_df[f'{col}_old'])
+                        merged_df.drop(columns=[f'{col}_old'], inplace=True)
+                
+                # For percentage columns, use new data if available, otherwise keep old
+                for col in ['Процент_ЦГ', 'Процент_Питон', 'Процент_Андан']:
+                    if f'{col}_old' in merged_df.columns and col in merged_df.columns:
+                        # Use new data if available, otherwise keep old (preserving NaN)
+                        merged_df[col] = merged_df.apply(
+                            lambda row: row[col] if pd.notna(row[col]) 
+                                       else (row[f'{col}_old'] if pd.notna(row[f'{col}_old']) else pd.NA), 
+                            axis=1
+                        )
+                        merged_df.drop(columns=[f'{col}_old'], inplace=True)
+                
+                # Keep NaN values for students not found in statistics (no longer fill with 0)
+                
+                print(f"Uploading merged data ({len(merged_df)} records) to Google Sheets...")
+                # Upload merged data in batches
+                upload_data_in_batches(worksheet, merged_df)
+            else:
+                # If no email column in existing data, treat as empty and upload all new data
+                print("No email column found in existing data, uploading all new data...")
+                upload_data_in_batches(worksheet, data_df)
         
-        # Data
-        data = [headers] + data_df.replace({pd.NA: '', pd.NaT: '', None: ''}).values.tolist()
-        
-        # Upload data
-        worksheet.update('A1', data)
-        
-        print(f"Data successfully updated in Google Sheets. Updated {len(data)-1} records.")
+        print("✅ Data successfully updated in Google Sheets")
         return True
     except Exception as e:
         print(f"Error updating Google Sheets: {str(e)}")
         return False
 
+def upload_data_in_batches(worksheet, data_df, batch_size=1000):
+    """Upload data to Google Sheets in batches"""
+    try:
+        # Clear existing data
+        worksheet.clear()
+        
+        # Upload headers first
+        headers = data_df.columns.tolist()
+        worksheet.update('A1', [headers])
+        
+        # Upload data in batches
+        total_rows = len(data_df)
+        total_batches = ((total_rows-1) // batch_size) + 1
+        print(f"Uploading {total_rows} rows in batches of {batch_size} ({total_batches} batches total)...")
+        
+        for i in range(0, total_rows, batch_size):
+            batch_num = i // batch_size + 1
+            batch_end = min(i + batch_size, total_rows)
+            batch_data = data_df.iloc[i:batch_end]
+            
+            # Convert to list format
+            data_batch = batch_data.replace({pd.NA: '', pd.NaT: '', None: ''}).values.tolist()
+            
+            # Calculate starting row for this batch (add 2 to account for 1-based indexing and headers)
+            start_row = i + 2
+            start_cell = f"A{start_row}"
+            
+            print(f"  Uploading batch {batch_num}/{total_batches}: rows {i+1}-{batch_end}")
+            worksheet.update(start_cell, data_batch)
+            print(f"    ✓ Batch {batch_num} uploaded successfully")
+        
+        return True
+    except Exception as e:
+        print(f"Error uploading data in batches: {str(e)}")
+        return False
+
 def main():
-    if len(sys.argv) != 4:
-        print("Usage: python simple_course_processor.py <excel_file> <csv_file> <credentials_file>")
-        print("Example: python simple_course_processor.py \"Список весь(1).xlsx\" \"Учебник_питон.csv\" \"/Users/timofeynikulin/data-culture-12ca9f5d6c82.json\"")
-        sys.exit(1)
+    # File paths
+    student_list_file = "Список весь(1).xlsx"
+    course_files = [
+        "course_analytics_result_20250925_175703.csv",  # ЦГ (Digital Literacy)
+        "course_analytics_result_20250925_175228.csv",  # Питон (Python)
+        "course_analytics_result_20250925_174913.csv"   # Андан (Analysis)
+    ]
+    credentials_file = "/Users/timofeynikulin/data-culture-12ca9f5d6c82.json"
     
-    excel_file = sys.argv[1]
-    csv_file = sys.argv[2]
-    credentials_file = sys.argv[3]
+    print("Consolidating course data")
+    print("=" * 50)
     
-    print("Processing course data for Google Sheets integration...")
-    print(f"Excel file: {excel_file}")
-    print(f"CSV file: {csv_file}")
-    print(f"Credentials file: {credentials_file}")
+    # Load student list
+    student_list = load_student_list(student_list_file)
     
-    # Load student data
-    print("\n1. Loading student data...")
-    student_df = load_excel_student_data(excel_file)
-    if student_df is None:
-        print("Failed to load student data")
-        sys.exit(1)
-    
-    # Load course data
-    print("\n2. Loading course data...")
-    course_df = load_csv_course_data(csv_file)
-    if course_df is None:
-        print("Failed to load course data")
-        sys.exit(1)
-    
-    # Process course analytics
-    print("\n3. Processing course analytics...")
-    progress_df = process_course_analytics(course_df)
-    if progress_df is None:
-        print("Failed to process course analytics")
-        sys.exit(1)
-    
-    # Merge data
-    print("\n4. Merging data...")
-    result_df = merge_student_and_course_data(student_df, progress_df)
-    if result_df is None:
-        print("Failed to merge data")
-        sys.exit(1)
+    # Consolidate data
+    consolidated_data = consolidate_data(student_list, course_files)
     
     # Save to CSV
-    output_file = f"course_analytics_result_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    result_df.to_csv(output_file, index=False, encoding='utf-8-sig')
-    print(f"\n5. Results saved to: {output_file}")
+    output_file = "consolidated_course_data.csv"
+    consolidated_data.to_csv(output_file, index=False, encoding='utf-8')
+    print(f"Saved consolidated data to {output_file}")
+    
+    # Show some statistics
+    print("\nCompletion Statistics:")
+    for course in ['ЦГ', 'Питон', 'Андан']:
+        col_name = f'Процент_{course}'
+        if col_name in consolidated_data.columns:
+            avg_completion = consolidated_data[col_name].mean()
+            students_100 = len(consolidated_data[consolidated_data[col_name] == 100.0])
+            students_0 = len(consolidated_data[consolidated_data[col_name] == 0.0])
+            print(f"{course}: Average {avg_completion:.2f}%, 100%: {students_100}, 0%: {students_0}")
     
     # Update Google Sheets
-    print("\n6. Updating Google Sheets...")
+    print("\nUpdating Google Sheets...")
     client = authenticate_google_sheets(credentials_file)
     if client:
-        success = update_google_sheet(client, result_df)
+        success = update_google_sheet_incremental(client, consolidated_data)
         if success:
-            print("✅ Google Sheets successfully updated!")
+            print("✅ Google Sheets updated successfully")
         else:
-            print("❌ Error updating Google Sheets")
+            print("❌ Failed to update Google Sheets")
     else:
         print("❌ Failed to authenticate with Google Sheets")
-    
-    print("\n✅ Processing completed successfully!")
 
 if __name__ == "__main__":
     main()
