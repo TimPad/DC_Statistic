@@ -1,107 +1,185 @@
 """
 Streamlit Application for Course Analytics Processing
-Upload files and process course data automatically
+Upload files and process course data automatically with Supabase database
 """
 
 import streamlit as st
 import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
+from supabase import create_client, Client
 import os
 import tempfile
 import time
 from io import StringIO
+from datetime import datetime
 
 # Page configuration
 st.set_page_config(
-    page_title="Обработка аналитики курсов",
+    page_title="Обработка аналитики курсов - Supabase",
     page_icon="📊",
     layout="wide"
 )
 
-def authenticate_google_sheets():
-    """Аутентификация с Google Sheets используя только Streamlit secrets"""
+def authenticate_supabase():
+    """Аутентификация с Supabase используя Streamlit secrets"""
     try:
-        # Проверяем наличие секретов
-        if not hasattr(st, 'secrets') or "gcp_service_account" not in st.secrets:
-            st.error("❌ Секреты GCP не найдены в конфигурации Streamlit")
-            st.error("💡 Для развертывания в Streamlit Cloud настройте секреты в разделе 'Secrets'")
-            st.error("📖 Подробная инструкция: STREAMLIT_CLOUD_DEPLOYMENT.md")
+        # Проверяем наличие секретов Supabase
+        if not hasattr(st, 'secrets') or "supabase" not in st.secrets:
+            st.error("❌ Секреты Supabase не найдены в конфигурации Streamlit")
+            st.error("💡 Для развертывания настройте секреты SUPABASE_URL и SUPABASE_KEY")
             return None
         
-        # Используем секреты из Streamlit Cloud
-        credentials_info = dict(st.secrets["gcp_service_account"])
+        # Получаем данные подключения из секретов
+        supabase_url = st.secrets["supabase"]["url"]
+        supabase_key = st.secrets["supabase"]["key"]
         
-        # Обработка формата private key - конвертация \n в реальные переносы строк
-        if 'private_key' in credentials_info:
-            private_key = credentials_info['private_key']
-            if '\\n' in private_key:
-                # Заменяем литеральные \n на реальные переносы строк
-                credentials_info['private_key'] = private_key.replace('\\n', '\n')
-            elif '\n' in private_key and not private_key.startswith('-----BEGIN'):
-                # Обрабатываем случай, когда \n уже правильно отформатирован
-                credentials_info['private_key'] = private_key.replace('\n', '\n')
+        # Создаем клиента Supabase
+        supabase: Client = create_client(supabase_url, supabase_key)
         
-        # Создаем клиента Google Sheets
-        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-        creds = Credentials.from_service_account_info(credentials_info, scopes=scope)
-        client = gspread.authorize(creds)
-        
-        st.success("✅ Аутентификация Google Sheets успешна (секреты Streamlit)")
-        return client
+        st.success("✅ Аутентификация Supabase успешна")
+        return supabase
         
     except Exception as e:
-        st.error(f"❌ Ошибка аутентификации Google Sheets: {str(e)}")
+        st.error(f"❌ Ошибка аутентификации Supabase: {str(e)}")
         return None
 
-def check_google_sheets_connection(client):
-    """Проверка подключения к Google Sheets"""
+def check_supabase_connection(supabase):
+    """Проверка подключения к Supabase"""
     try:
-        if client is None:
-            st.error("❌ Клиент Google Sheets не инициализирован")
+        if supabase is None:
+            st.error("❌ Клиент Supabase не инициализирован")
             return False
         
-        # Попытка открыть таблицу DC_stat
-        st.info("🔍 Проверка подключения к Google Sheets...")
+        st.info("🔍 Проверка подключения к Supabase...")
         
+        # Проверяем доступ к таблице course_analytics
         try:
-            spreadsheet = client.open('DC_stat')
-            st.success(f"✅ Таблица 'DC_stat' найдена. ID: {spreadsheet.id}")
-        except gspread.SpreadsheetNotFound:
-            st.error("❌ Таблица 'DC_stat' не найдена или нет доступа")
-            st.error("💡 Убедитесь, что таблица существует и открыт доступ для service account")
-            return False
-        
-        try:
-            worksheet = spreadsheet.worksheet('Лист1')
-            st.success(f"✅ Лист 'Лист1' доступен. Размер: {worksheet.row_count}x{worksheet.col_count}")
-        except gspread.WorksheetNotFound:
-            st.error("❌ Лист 'Лист1' не найден")
-            st.error("💡 Проверьте название листа в Google Sheets")
-            return False
-        
-        # Проверка прав на запись
-        try:
-            # Попытка получить данные из первой ячейки
-            test_cell = worksheet.acell('A1')
-            st.success(f"✅ Права на чтение подтверждены (A1: '{test_cell.value}')")
+            # Попытка получить схему таблицы
+            result = supabase.table('course_analytics').select('*').limit(1).execute()
+            st.success("✅ Таблица 'course_analytics' доступна")
             
             # Проверка прав на запись (тестовая запись)
-            import datetime
-            test_value = f"Тест подключения {datetime.datetime.now().strftime('%H:%M:%S')}"
-            # Используем правильный формат для API - передаем значение как список
-            worksheet.update('Z1', [[test_value]])
-            st.success("✅ Права на запись подтверждены")
+            test_record = {
+                'фио': f'Тест подключения {datetime.now().strftime("%H:%M:%S")}',
+                'корпоративная_почта': 'test@connection.check',
+                'филиал_кампус': 'Тест',
+                'факультет': 'Тест',
+                'образовательная_программа': 'Тест',
+                'группа': 'Тест',
+                'курс': 'Тест',
+                'процент_цг': 0.0,
+                'процент_питон': 0.0,
+                'процент_андан': 0.0,
+                'created_at': datetime.now().isoformat()
+            }
             
+            # Записываем тестовую запись
+            insert_result = supabase.table('course_analytics').insert(test_record).execute()
+            
+            if insert_result.data:
+                test_id = insert_result.data[0]['id']
+                st.success("✅ Права на запись подтверждены")
+                
+                # Удаляем тестовую запись
+                supabase.table('course_analytics').delete().eq('id', test_id).execute()
+                st.success("✅ Права на удаление подтверждены")
+            else:
+                st.error("❌ Не удалось записать тестовые данные")
+                return False
+                
         except Exception as e:
-            st.error(f"❌ Ошибка проверки прав доступа: {str(e)}")
-            return False
+            if "relation \"course_analytics\" does not exist" in str(e).lower():
+                st.warning("⚠️ Таблица 'course_analytics' не существует. Будет создана автоматически.")
+                # Создаем таблицу
+                if not create_course_analytics_table(supabase):
+                    return False
+            elif "row-level security policy" in str(e).lower() or "42501" in str(e):
+                st.error("❌ Ошибка Row Level Security (RLS): доступ к таблице заблокирован политиками безопасности")
+                st.error("💡 Необходимо настроить RLS политики в Supabase Dashboard:")
+                st.code("""
+-- В Supabase SQL Editor выполните:
+
+-- 1. Отключить RLS для таблицы (рекомендуется для внутренних приложений)
+ALTER TABLE course_analytics DISABLE ROW LEVEL SECURITY;
+
+-- ИЛИ
+
+-- 2. Создать политику для разрешения всех операций (более безопасно)
+CREATE POLICY "Enable all operations for service role" ON course_analytics
+FOR ALL USING (true) WITH CHECK (true);
+
+-- 3. Альтернативно: политика только для authenticated пользователей
+CREATE POLICY "Enable operations for authenticated users" ON course_analytics
+FOR ALL USING (auth.role() = 'authenticated') WITH CHECK (auth.role() = 'authenticated');
+                """, language='sql')
+                return False
+            else:
+                st.error(f"❌ Ошибка доступа к таблице: {str(e)}")
+                return False
         
-        st.success("🎉 Подключение к Google Sheets полностью работоспособно!")
+        st.success("🎉 Подключение к Supabase полностью работоспособно!")
         return True
         
     except Exception as e:
         st.error(f"❌ Общая ошибка проверки подключения: {str(e)}")
+        return False
+
+def create_course_analytics_table(supabase):
+    """Создание таблицы course_analytics в Supabase"""
+    try:
+        st.info("🔧 Создание таблицы course_analytics...")
+        
+        # SQL для создания таблицы
+        create_table_sql = """
+        CREATE TABLE IF NOT EXISTS course_analytics (
+            id SERIAL PRIMARY KEY,
+            фио TEXT NOT NULL,
+            корпоративная_почта TEXT UNIQUE NOT NULL,
+            филиал_кампус TEXT,
+            факультет TEXT,
+            образовательная_программа TEXT,
+            группа TEXT,
+            курс TEXT,
+            процент_цг REAL DEFAULT 0.0,
+            процент_питон REAL DEFAULT 0.0,
+            процент_андан REAL DEFAULT 0.0,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        );
+        
+        -- Создаем индекс на email для быстрого поиска
+        CREATE INDEX IF NOT EXISTS idx_course_analytics_email 
+        ON course_analytics(корпоративная_почта);
+        
+        -- Функция для автоматического обновления updated_at
+        CREATE OR REPLACE FUNCTION update_updated_at_column()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            NEW.updated_at = NOW();
+            RETURN NEW;
+        END;
+        $$ language 'plpgsql';
+        
+        -- Триггер для автоматического обновления updated_at
+        DROP TRIGGER IF EXISTS update_course_analytics_updated_at ON course_analytics;
+        CREATE TRIGGER update_course_analytics_updated_at
+            BEFORE UPDATE ON course_analytics
+            FOR EACH ROW
+            EXECUTE FUNCTION update_updated_at_column();
+        """
+        
+        # Выполняем SQL через RPC (если поддерживается) или через прямой запрос
+        try:
+            result = supabase.rpc('exec_sql', {'sql': create_table_sql}).execute()
+            st.success("✅ Таблица course_analytics создана успешно")
+            return True
+        except Exception as rpc_error:
+            st.warning(f"⚠️ RPC недоступен: {str(rpc_error)}")
+            st.info("💡 Создайте таблицу course_analytics вручную в Supabase Dashboard")
+            st.code(create_table_sql, language='sql')
+            return False
+            
+    except Exception as e:
+        st.error(f"❌ Ошибка создания таблицы: {str(e)}")
         return False
 
 def load_student_list(uploaded_file):
@@ -362,57 +440,72 @@ def consolidate_data(student_list, course_data_list, course_names):
         st.error(f"Error consolidating data: {str(e)}")
         return None
 
-def upload_to_google_sheets(client, data_df, batch_size=200):
-    """Upload data to Google Sheets with progress bar"""
+def upload_to_supabase(supabase, data_df, batch_size=200):
+    """Загрузка данных в Supabase с прогресс-баром"""
     try:
-        # Open the Google Sheet
-        spreadsheet = client.open('DC_stat')
-        worksheet = spreadsheet.worksheet('Лист1')
+        # Очищаем существующие данные
+        st.info("🗑️ Очистка существующих данных в базе данных...")
+        delete_result = supabase.table('course_analytics').delete().neq('id', 0).execute()
+        st.success(f"✅ Удалено {len(delete_result.data) if delete_result.data else 0} старых записей")
         
-        # Clear existing data
-        st.info("Очистка существующих данных в Google Sheets...")
-        worksheet.clear()
+        # Подготавливаем данные для загрузки
+        records_to_insert = []
         
-        # Upload headers first
-        headers = data_df.columns.tolist()
-        st.info("Загрузка заголовков...")
-        worksheet.update(values=[headers], range_name='A1')
+        for _, row in data_df.iterrows():
+            record = {
+                'фио': str(row.get('ФИО', '')).strip(),
+                'корпоративная_почта': str(row.get('Корпоративная почта', '')).strip().lower(),
+                'филиал_кампус': str(row.get('Филиал (кампус)', '')).strip(),
+                'факультет': str(row.get('Факультет', '')).strip(),
+                'образовательная_программа': str(row.get('Образовательная программа', '')).strip(),
+                'группа': str(row.get('Группа', '')).strip(),
+                'курс': str(row.get('Курс', '')).strip(),
+                'процент_цг': float(row.get('Процент_ЦГ', 0.0) or 0.0),
+                'процент_питон': float(row.get('Процент_Питон', 0.0) or 0.0),
+                'процент_андан': float(row.get('Процент_Андан', 0.0) or 0.0),
+                'created_at': datetime.now().isoformat()
+            }
+            records_to_insert.append(record)
         
-        # Upload data in batches with progress bar
-        total_rows = len(data_df)
-        total_batches = ((total_rows-1) // batch_size) + 1
+        # Загружаем данные по пакетам с прогресс-баром
+        total_records = len(records_to_insert)
+        total_batches = ((total_records-1) // batch_size) + 1
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         successful_batches = 0
         
-        for i in range(0, total_rows, batch_size):
+        for i in range(0, total_records, batch_size):
             batch_num = i // batch_size + 1
-            batch_end = min(i + batch_size, total_rows)
-            batch_data = data_df.iloc[i:batch_end]
-            
-            # Convert to list format
-            data_batch = batch_data.replace({pd.NA: '', pd.NaT: '', None: ''}).values.tolist()
-            
-            # Calculate starting row for this batch
-            start_row = i + 2
-            start_cell = f"A{start_row}"
+            batch_end = min(i + batch_size, total_records)
+            batch_data = records_to_insert[i:batch_end]
             
             try:
-                status_text.text(f"Загрузка пакета {batch_num}/{total_batches}: строки {i+1}-{batch_end}")
-                worksheet.update(values=data_batch, range_name=start_cell)
-                successful_batches += 1
+                status_text.text(f"Загрузка пакета {batch_num}/{total_batches}: записи {i+1}-{batch_end}")
                 
-                # Update progress bar
+                result = supabase.table('course_analytics').insert(batch_data).execute()
+                
+                if result.data:
+                    successful_batches += 1
+                    st.success(f"✅ Пакет {batch_num}: загружено {len(result.data)} записей")
+                else:
+                    st.error(f"❌ Пакет {batch_num}: не удалось загрузить данные")
+                
+                # Обновляем прогресс-бар
                 progress = batch_num / total_batches
                 progress_bar.progress(progress)
                 
-                # Small delay to avoid rate limiting
-                time.sleep(0.5)
+                # Небольшая задержка для избежания лимитов рате
+                time.sleep(0.1)
                 
             except Exception as e:
-                st.error(f"Не удалось загрузить пакет {batch_num}: {str(e)}")
+                error_msg = str(e)
+                if "row-level security policy" in error_msg.lower() or "42501" in error_msg:
+                    st.error(f"❌ Пакет {batch_num}: Ошибка Row Level Security")
+                    st.error("💡 Необходимо настроить RLS политики в Supabase. Отключите RLS или создайте политику разрешения.")
+                else:
+                    st.error(f"Не удалось загрузить пакет {batch_num}: {error_msg}")
                 return False
         
         progress_bar.progress(1.0)
@@ -420,12 +513,12 @@ def upload_to_google_sheets(client, data_df, batch_size=200):
         return True
         
     except Exception as e:
-        st.error(f"Ошибка загрузки в Google Sheets: {str(e)}")
+        st.error(f"Ошибка загрузки в Supabase: {str(e)}")
         return False
 
 def main():
     st.title("📊 Обработка аналитики курсов")
-    st.markdown("Загрузите файлы и обработайте аналитику курсов автоматически")
+    st.markdown("Загрузите файлы и обработайте аналитику курсов автоматически с сохранением в Supabase")
     
     # Sidebar for file uploads
     st.sidebar.header("📁 Загрузка файлов")
@@ -499,21 +592,21 @@ def main():
                 
                 with st.spinner("Обработка данных..."):
                     
-                    # Step 0: Проверка подключения к Google Sheets
-                    st.info("🔍 Проверка подключения к Google Sheets...")
-                    client = authenticate_google_sheets()
-                    if client is None:
-                        st.error("❌ Не удалось установить подключение к Google Sheets")
+                    # Step 0: Проверка подключения к Supabase
+                    st.info("🔍 Проверка подключения к Supabase...")
+                    supabase = authenticate_supabase()
+                    if supabase is None:
+                        st.error("❌ Не удалось установить подключение к Supabase")
                         st.error("💡 Проверьте конфигурацию секретов и повторите попытку")
                         st.stop()
                     
                     # Проверяем работоспособность подключения
-                    if not check_google_sheets_connection(client):
-                        st.error("❌ Подключение к Google Sheets не работает")
+                    if not check_supabase_connection(supabase):
+                        st.error("❌ Подключение к Supabase не работает")
                         st.error("💡 Устраните проблемы с доступом и повторите попытку")
                         st.stop()
                     
-                    st.success("✅ Подключение к Google Sheets проверено и работает")
+                    st.success("✅ Подключение к Supabase проверено и работает")
                     
                     # Step 1: Load student list
                     st.info("📚 Загрузка списка студентов...")
@@ -560,26 +653,26 @@ def main():
                                     delta=f"100%: {students_100} | 0%: {students_0}"
                                 )
                     
-                    # Step 5: Update Google Sheets
-                    st.info("☁️ Обновление Google Sheets...")
-                    # Используем уже проверенный клиент
+                    # Step 5: Обновление базы данных Supabase
+                    st.info("💾 Обновление базы данных Supabase...")
+                    # Используем уже проверенное подключение
                     
-                    success = upload_to_google_sheets(client, consolidated_data)
+                    success = upload_to_supabase(supabase, consolidated_data)
                     if success:
                         st.success("🎉 Вся обработка завершена успешно!")
                         st.balloons()
                     else:
-                        st.error("❌ Не удалось загрузить в Google Sheets")
+                        st.error("❌ Не удалось загрузить в Supabase")
     
     with col2:
         st.header("ℹ️ Информация")
         
         # Кнопка проверки подключения
         st.subheader("🔍 Проверка подключения")
-        if st.button("🔍 Проверить Google Sheets", type="secondary"):
-            client = authenticate_google_sheets()
-            if client:
-                check_google_sheets_connection(client)
+        if st.button("🔍 Проверить Supabase", type="secondary"):
+            supabase = authenticate_supabase()
+            if supabase:
+                check_supabase_connection(supabase)
         
         st.markdown("---")
         st.markdown("""
@@ -588,10 +681,10 @@ def main():
         - Данные курсов в формате CSV (.csv) или Excel (.xlsx, .xls) со столбцами:
           - `Корпоративная почта`
           - `Процент завершения`
-        - Настроенный доступ к Google Sheets
+        - Настроенное подключение к Supabase
         
         **Результат:**
-        - Консолидированные данные загружены в Google Sheet "DC_stat"
+        - Консолидированные данные загружены в базу данных Supabase
         - Информация о студентах с процентами завершения
         - Нулевые значения для студентов, не найденных в данных курсов
         
@@ -600,7 +693,7 @@ def main():
         2. Обработка трех файлов курсов
         3. Консолидация данных по email
         4. Генерация статистики завершения
-        5. Загрузка в Google Sheets
+        5. Загрузка в базу данных Supabase
         
         **Поддерживаемые кодировки:**
         - UTF-8 (по умолчанию)
