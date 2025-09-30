@@ -475,16 +475,16 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
             processed_emails.add(email)
             
             new_record = {
-                'фио': str(row.get('ФИО', '')).strip(),
-                'корпоративная_почта': email,
-                'филиал_кампус': str(row.get('Филиал (кампус)', '')).strip(),
-                'факультет': str(row.get('Факультет', '')).strip(),
-                'образовательная_программа': str(row.get('Образовательная программа', '')).strip(),
-                'группа': str(row.get('Группа', '')).strip(),
-                'курс': str(row.get('Курс', '')).strip(),
-                'процент_цг': float(row.get('Процент_ЦГ', 0.0) or 0.0),
-                'процент_питон': float(row.get('Процент_Питон', 0.0) or 0.0),
-                'процент_андан': float(row.get('Процент_Андан', 0.0) or 0.0)
+                'фио': str(row.get('ФИО', '')) if pd.notna(row.get('ФИО')) else None,
+                'корпоративная_почта': email if email else None,
+                'филиал_кампус': str(row.get('Филиал (кампус)', '')) if pd.notna(row.get('Филиал (кампус)')) and str(row.get('Филиал (кампус)', '')).strip() else None,
+                'факультет': str(row.get('Факультет', '')) if pd.notna(row.get('Факультет')) and str(row.get('Факультет', '')).strip() else None,
+                'образовательная_программа': str(row.get('Образовательная программа', '')) if pd.notna(row.get('Образовательная программа')) and str(row.get('Образовательная программа', '')).strip() else None,
+                'группа': str(row.get('Группа', '')) if pd.notna(row.get('Группа')) and str(row.get('Группа', '')).strip() else None,
+                'курс': str(row.get('Курс', '')) if pd.notna(row.get('Курс')) and str(row.get('Курс', '')).strip() else None,
+                'процент_цг': float(row.get('Процент_ЦГ', 0.0)) if pd.notna(row.get('Процент_ЦГ')) and row.get('Процент_ЦГ') != '' else None,
+                'процент_питон': float(row.get('Процент_Питон', 0.0)) if pd.notna(row.get('Процент_Питон')) and row.get('Процент_Питон') != '' else None,
+                'процент_андан': float(row.get('Процент_Андан', 0.0)) if pd.notna(row.get('Процент_Андан')) and row.get('Процент_Андан') != '' else None
             }
             
             if email in existing_data:
@@ -501,11 +501,21 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                     
                     # Для числовых полей сравниваем с толерантностью
                     if key.startswith('процент_'):
-                        if abs(float(existing_value or 0) - float(value)) > 0.01:  # Толерантность 0.01%
+                        # Сравниваем NULL значения
+                        if value is None and existing_value is None:
+                            continue
+                        if value is None or existing_value is None:
+                            needs_update = True
+                            break
+                        if abs(float(existing_value) - float(value)) > 0.01:  # Толерантность 0.01%
                             needs_update = True
                             break
                     else:
-                        if str(existing_value or '').strip() != str(value).strip():
+                        # Для текстовых полей сравниваем NULL и строки
+                        existing_str = str(existing_value).strip() if existing_value is not None else None
+                        new_str = str(value).strip() if value is not None else None
+                        
+                        if existing_str != new_str:
                             needs_update = True
                             break
                 
