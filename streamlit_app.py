@@ -209,7 +209,7 @@ def load_student_list(uploaded_file):
         # Map columns to required format
         required_columns = {
             'ФИО': ['фио', 'фio', 'имя', 'name'],
-            'Корпоративная почта': ['корпоративная почта', 'email', 'почта', 'e-mail'],
+            'Корпоративная почта': ['адрес электронной почты', 'корпоративная почта', 'email', 'почта', 'e-mail'],
             'Филиал (кампус)': ['филиал', 'кампус', 'campus'],
             'Факультет': ['факультет', 'faculty'],
             'Образовательная программа': ['образовательная программа', 'программа', 'educational program'],
@@ -284,7 +284,7 @@ def extract_course_data(uploaded_file, course_name):
         
         # Look for email column with different possible names
         email_column = None
-        possible_email_names = ['Корпоративная почта', 'Адрес электронной почты', 'Email', 'Почта', 'E-mail']
+        possible_email_names = ['Адрес электронной почты', 'Корпоративная почта', 'Email', 'Почта', 'E-mail']
         
         for col_name in possible_email_names:
             if col_name in df.columns:
@@ -441,20 +441,42 @@ def consolidate_data(student_list, course_data_list, course_names):
         return None
 
 def upload_to_supabase(supabase, data_df, batch_size=200):
-    """Загрузка данных в Supabase с прогресс-баром"""
+    """Инкрементальная загрузка данных в Supabase с прогресс-баром"""
     try:
-        # Очищаем существующие данные
-        st.info("🗑️ Очистка существующих данных в базе данных...")
-        delete_result = supabase.table('course_analytics').delete().neq('id', 0).execute()
-        st.success(f"✅ Удалено {len(delete_result.data) if delete_result.data else 0} старых записей")
+        # Получаем существующие данные для сравнения
+        st.info("🔍 Проверка существующих данных в базе...")
+        existing_result = supabase.table('course_analytics').select('*').execute()
+        existing_data = {}
         
-        # Подготавливаем данные для загрузки
+        # Создаем словарь существующих записей по email
+        if existing_result.data:
+            for record in existing_result.data:
+                email = record.get('корпоративная_почта', '').lower().strip()
+                if email:
+                    existing_data[email] = record
+        
+        st.success(f"✅ Найдено {len(existing_data)} существующих записей")
+        
+        # Подготавливаем данные для обновления
         records_to_insert = []
+        records_to_update = []
+        unchanged_count = 0
+        processed_emails = set()  # Отслеживаем обработанные email для избежания дубликатов
         
         for _, row in data_df.iterrows():
-            record = {
+            # Используем правильное название колонки email из памяти проекта
+            email = str(row.get('Корпоративная почта', '')).strip().lower()
+            if not email:  # Пробуем альтернативное название
+                email = str(row.get('Адрес электронной почты', '')).strip().lower()
+            
+            # Пропускаем дубликаты в текущем наборе данных
+            if email in processed_emails:
+                continue
+            processed_emails.add(email)
+            
+            new_record = {
                 'фио': str(row.get('ФИО', '')).strip(),
-                'корпоративная_почта': str(row.get('Корпоративная почта', '')).strip().lower(),
+                'корпоративная_почта': email,
                 'филиал_кампус': str(row.get('Филиал (кампус)', '')).strip(),
                 'факультет': str(row.get('Факультет', '')).strip(),
                 'образовательная_программа': str(row.get('Образовательная программа', '')).strip(),
@@ -462,58 +484,118 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                 'курс': str(row.get('Курс', '')).strip(),
                 'процент_цг': float(row.get('Процент_ЦГ', 0.0) or 0.0),
                 'процент_питон': float(row.get('Процент_Питон', 0.0) or 0.0),
-                'процент_андан': float(row.get('Процент_Андан', 0.0) or 0.0),
-                'created_at': datetime.now().isoformat()
+                'процент_андан': float(row.get('Процент_Андан', 0.0) or 0.0)
             }
-            records_to_insert.append(record)
+            
+            if email in existing_data:
+                # Проверяем, изменились ли данные
+                existing_record = existing_data[email]
+                needs_update = False
+                
+                # Сравниваем ключевые поля
+                for key, value in new_record.items():
+                    if key == 'корпоративная_почта':
+                        continue  # Пропускаем ключевое поле
+                    
+                    existing_value = existing_record.get(key)
+                    
+                    # Для числовых полей сравниваем с толерантностью
+                    if key.startswith('процент_'):
+                        if abs(float(existing_value or 0) - float(value)) > 0.01:  # Толерантность 0.01%
+                            needs_update = True
+                            break
+                    else:
+                        if str(existing_value or '').strip() != str(value).strip():
+                            needs_update = True
+                            break
+                
+                if needs_update:
+                    new_record['id'] = existing_record['id']  # Добавляем ID для обновления
+                    records_to_update.append(new_record)
+                else:
+                    unchanged_count += 1
+            else:
+                # Новая запись
+                new_record['created_at'] = datetime.now().isoformat()
+                records_to_insert.append(new_record)
         
-        # Загружаем данные по пакетам с прогресс-баром
-        total_records = len(records_to_insert)
-        total_batches = ((total_records-1) // batch_size) + 1
+        st.info(f"📋 Анализ изменений: {len(records_to_insert)} новых, {len(records_to_update)} обновлений, {unchanged_count} без изменений")
+        
+        if len(records_to_insert) == 0 and len(records_to_update) == 0:
+            st.success("✅ Никаких изменений не обнаружено. База данных актуальна.")
+            return True
+        
+        total_operations = len(records_to_insert) + len(records_to_update)
+        total_batches = ((total_operations-1) // batch_size) + 1
         
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        successful_batches = 0
+        successful_operations = 0
+        current_operation = 0
         
-        for i in range(0, total_records, batch_size):
-            batch_num = i // batch_size + 1
-            batch_end = min(i + batch_size, total_records)
-            batch_data = records_to_insert[i:batch_end]
+        # Обрабатываем новые записи
+        if records_to_insert:
+            st.info(f"➕ Добавление {len(records_to_insert)} новых записей...")
             
-            try:
-                status_text.text(f"Загрузка пакета {batch_num}/{total_batches}: записи {i+1}-{batch_end}")
+            for i in range(0, len(records_to_insert), batch_size):
+                batch_num = current_operation // batch_size + 1
+                batch_end = min(i + batch_size, len(records_to_insert))
+                batch_data = records_to_insert[i:batch_end]
                 
-                result = supabase.table('course_analytics').insert(batch_data).execute()
-                
-                if result.data:
-                    successful_batches += 1
-                    st.success(f"✅ Пакет {batch_num}: загружено {len(result.data)} записей")
-                else:
-                    st.error(f"❌ Пакет {batch_num}: не удалось загрузить данные")
-                
-                # Обновляем прогресс-бар
-                progress = batch_num / total_batches
-                progress_bar.progress(progress)
-                
-                # Небольшая задержка для избежания лимитов рате
-                time.sleep(0.1)
-                
-            except Exception as e:
-                error_msg = str(e)
-                if "row-level security policy" in error_msg.lower() or "42501" in error_msg:
-                    st.error(f"❌ Пакет {batch_num}: Ошибка Row Level Security")
-                    st.error("💡 Необходимо настроить RLS политики в Supabase. Отключите RLS или создайте политику разрешения.")
-                else:
-                    st.error(f"Не удалось загрузить пакет {batch_num}: {error_msg}")
-                return False
+                try:
+                    status_text.text(f"Добавление пакета {batch_num}: записи {i+1}-{batch_end}")
+                    
+                    result = supabase.table('course_analytics').insert(batch_data).execute()
+                    
+                    if result.data:
+                        successful_operations += len(result.data)
+                    
+                    current_operation += len(batch_data)
+                    progress = current_operation / total_operations
+                    progress_bar.progress(progress)
+                    
+                    time.sleep(0.1)
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    if "row-level security policy" in error_msg.lower() or "42501" in error_msg:
+                        st.error(f"❌ Пакет {batch_num}: Ошибка Row Level Security")
+                        st.error("💡 Необходимо настроить RLS политики в Supabase. Отключите RLS или создайте политику разрешения.")
+                    else:
+                        st.error(f"Не удалось добавить пакет {batch_num}: {error_msg}")
+                    return False
+        
+        # Обрабатываем обновления
+        if records_to_update:
+            st.info(f"🔄 Обновление {len(records_to_update)} существующих записей...")
+            
+            for record in records_to_update:
+                try:
+                    record_id = record.pop('id')  # Удаляем ID из данных обновления
+                    
+                    result = supabase.table('course_analytics').update(record).eq('id', record_id).execute()
+                    
+                    if result.data:
+                        successful_operations += 1
+                    
+                    current_operation += 1
+                    progress = current_operation / total_operations
+                    progress_bar.progress(progress)
+                    
+                    if current_operation % 10 == 0:  # Обновляем статус каждые 10 операций
+                        status_text.text(f"Обновлено записей: {current_operation - len(records_to_insert)}/{len(records_to_update)}")
+                    
+                except Exception as e:
+                    st.error(f"Не удалось обновить запись: {str(e)}")
+                    return False
         
         progress_bar.progress(1.0)
-        status_text.text(f"✅ Загрузка завершена: {successful_batches} пакетов загружено успешно")
+        status_text.text(f"✅ Инкрементальное обновление завершено: {successful_operations} операций выполнено")
         return True
         
     except Exception as e:
-        st.error(f"Ошибка загрузки в Supabase: {str(e)}")
+        st.error(f"Ошибка инкрементального обновления Supabase: {str(e)}")
         return False
 
 def main():
