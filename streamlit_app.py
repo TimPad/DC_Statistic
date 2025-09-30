@@ -64,6 +64,7 @@ def check_supabase_connection(supabase):
                 'филиал_кампус': 'Тест',
                 'факультет': 'Тест',
                 'образовательная_программа': 'Тест',
+                'версия_образовательной_программы': 'Тест',
                 'группа': 'Тест',
                 'курс': 'Тест',
                 'процент_цг': 0.0,
@@ -471,6 +472,10 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
             if not email:  # Пробуем альтернативное название
                 email = str(row.get('Адрес электронной почты', '')).strip().lower()
             
+            # Пропускаем записи без email или с неправильным доменом
+            if not email or '@edu.hse.ru' not in email:
+                continue
+            
             # Пропускаем дубликаты в текущем наборе данных
             if email in processed_emails:
                 continue
@@ -482,6 +487,7 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                 'филиал_кампус': str(row.get('Филиал (кампус)', '')) if pd.notna(row.get('Филиал (кампус)')) and str(row.get('Филиал (кампус)', '')).strip() else None,
                 'факультет': str(row.get('Факультет', '')) if pd.notna(row.get('Факультет')) and str(row.get('Факультет', '')).strip() else None,
                 'образовательная_программа': str(row.get('Образовательная программа', '')) if pd.notna(row.get('Образовательная программа')) and str(row.get('Образовательная программа', '')).strip() else None,
+                'версия_образовательной_программы': str(row.get('Версия образовательной программы', '')) if pd.notna(row.get('Версия образовательной программы')) and str(row.get('Версия образовательной программы', '')).strip() else None,
                 'группа': str(row.get('Группа', '')) if pd.notna(row.get('Группа')) and str(row.get('Группа', '')).strip() else None,
                 'курс': str(row.get('Курс', '')) if pd.notna(row.get('Курс')) and str(row.get('Курс', '')).strip() else None,
                 'процент_цг': float(row.get('Процент_ЦГ', 0.0)) if pd.notna(row.get('Процент_ЦГ')) and row.get('Процент_ЦГ') != '' else None,
@@ -489,6 +495,7 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                 'процент_андан': float(row.get('Процент_Андан', 0.0)) if pd.notna(row.get('Процент_Андан')) and row.get('Процент_Андан') != '' else None
             }
             
+            # Проверяем, есть ли этот email в базе данных (существующие записи)
             if email in existing_data:
                 # Проверяем, изменились ли данные
                 existing_record = existing_data[email]
@@ -574,9 +581,26 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                     if "row-level security policy" in error_msg.lower() or "42501" in error_msg:
                         st.error(f"❌ Пакет {batch_num}: Ошибка Row Level Security")
                         st.error("💡 Необходимо настроить RLS политики в Supabase. Отключите RLS или создайте политику разрешения.")
+                    elif "duplicate key value violates unique constraint" in error_msg.lower() or "23505" in error_msg:
+                        st.error(f"❌ Пакет {batch_num}: Ошибка дубликата ключа")
+                        st.error("💡 Обнаружены дубликаты email в базе. Проверьте исходные данные.")
+                        # Попытаемся обработать каждую запись индивидуально
+                        st.info("🔄 Попытка индивидуальной обработки записей...")
+                        individual_success = 0
+                        for record in batch_data:
+                            try:
+                                individual_result = supabase.table('course_analytics').insert([record]).execute()
+                                if individual_result.data:
+                                    individual_success += 1
+                            except Exception as individual_error:
+                                # Логируем ошибки для отдельных записей, но продолжаем
+                                pass
+                        if individual_success > 0:
+                            successful_operations += individual_success
+                            st.success(f"✅ Обработано индивидуально: {individual_success} записей")
                     else:
                         st.error(f"Не удалось добавить пакет {batch_num}: {error_msg}")
-                    return False
+                        return False
         
         # Обрабатываем обновления
         if records_to_update:
