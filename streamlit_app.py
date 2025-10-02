@@ -447,7 +447,7 @@ def extract_course_data(uploaded_file, course_name):
         return None
 
 def consolidate_data(student_list, course_data_list, course_names):
-    """Consolidate all course data with student list"""
+    """Consolidate all course data with student list and deduplication"""
     try:
         # Start with student list
         consolidated = student_list.copy()
@@ -456,10 +456,40 @@ def consolidate_data(student_list, course_data_list, course_names):
         for course_data, course_name in zip(course_data_list, course_names):
             if course_data is not None:
                 consolidated = pd.merge(consolidated, course_data, on='Корпоративная почта', how='left')
-                # Fill NaN values with 0
-                consolidated[f'Процент_{course_name}'] = consolidated[f'Процент_{course_name}'].fillna(0.0)
+                # Заполняем NULL значения (не 0.0)
+                consolidated[f'Процент_{course_name}'] = consolidated[f'Процент_{course_name}'].where(pd.notna(consolidated[f'Процент_{course_name}']), None)
+        
+        # Критическая дедупликация по email
+        st.info("🔍 Проверка и удаление дубликатов...")
+        
+        # Проверяем наличие дубликатов
+        initial_count = len(consolidated)
+        email_counts = consolidated['Корпоративная почта'].value_counts()
+        duplicates = email_counts[email_counts > 1]
+        
+        if len(duplicates) > 0:
+            st.warning(f"⚠️ Обнаружено {len(duplicates)} дубликатов email:")
+            # Показываем первые несколько дубликатов
+            duplicate_list = list(duplicates.index[:5])
+            for email in duplicate_list:
+                count = duplicates[email]
+                st.text(f"  - {email}: {count} записей")
+            if len(duplicates) > 5:
+                st.text(f"  ... и ещё {len(duplicates) - 5} дубликатов")
+        
+        # Удаляем дубликаты, оставляя первое вхождение
+        consolidated = consolidated.drop_duplicates(subset=['Корпоративная почта'], keep='first')
+        
+        final_count = len(consolidated)
+        removed_count = initial_count - final_count
+        
+        if removed_count > 0:
+            st.success(f"✅ Удалено {removed_count} дубликатов. Осталось {final_count} уникальных записей")
+        else:
+            st.success(f"✅ Дубликаты не обнаружены. Всего {final_count} уникальных записей")
         
         return consolidated
+        
     except Exception as e:
         st.error(f"Error consolidating data: {str(e)}")
         return None
@@ -545,9 +575,22 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                         existing_str = str(existing_value).strip() if existing_value is not None else None
                         new_str = str(value).strip() if value is not None else None
                         
-                        if existing_str != new_str:
-                            needs_update = True
-                            break
+                        # Особое внимание к полю версия_образовательной_программы
+                        if key == 'версия_образовательной_программы':
+                            # Если в базе NULL, а в новых данных есть значение - обновляем
+                            if existing_value is None and new_str is not None and new_str != '':
+                                needs_update = True
+                                st.info(f"🔄 Обновление {email}: добавление версии программы '{new_str}'")
+                                break
+                            # Если значения разные - обновляем
+                            elif existing_str != new_str:
+                                needs_update = True
+                                st.info(f"🔄 Обновление {email}: изменение версии с '{existing_str}' на '{new_str}'")
+                                break
+                        else:
+                            if existing_str != new_str:
+                                needs_update = True
+                                break
                 
                 if needs_update:
                     new_record['id'] = existing_record['id']  # Добавляем ID для обновления
