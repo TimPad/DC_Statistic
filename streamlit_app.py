@@ -532,22 +532,8 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                 continue
             processed_emails.add(email)
             
-            # Гарантируем ненулевое ФИО: берем из данных, иначе формируем из email
-            raw_name = row.get('ФИО')
-            name_str = ''
-            if pd.notna(raw_name):
-                name_str = str(raw_name).strip()
-            if not name_str:
-                # Формируем из email (до @), заменяя разделители и нормализуя регистр
-                email_prefix = email.split('@')[0] if email else ''
-                normalized = email_prefix.replace('.', ' ').replace('_', ' ').strip()
-                name_str = normalized.title() if normalized else email
-            # На всякий случай исключаем None: БД требует NOT NULL
-            if name_str is None:
-                name_str = ''
-
             new_record = {
-                'фио': name_str,
+                'фио': str(row.get('ФИО', 'Неизвестно')).strip() if pd.notna(row.get('ФИО')) and str(row.get('ФИО', '')).strip() else 'Неизвестно',
                 'корпоративная_почта': email if email else None,
                 'филиал_кампус': str(row.get('Филиал (кампус)', '')) if pd.notna(row.get('Филиал (кампус)')) and str(row.get('Филиал (кампус)', '')).strip() else None,
                 'факультет': str(row.get('Факультет', '')) if pd.notna(row.get('Факультет')) and str(row.get('Факультет', '')).strip() else None,
@@ -565,7 +551,6 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                 # Проверяем, изменились ли данные
                 existing_record = existing_data[email]
                 needs_update = False
-                changed_fields = {}
                 
                 # Сравниваем ключевые поля
                 for key, value in new_record.items():
@@ -581,12 +566,10 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                             continue
                         if value is None or existing_value is None:
                             needs_update = True
-                            changed_fields[key] = value
-                            continue
+                            break
                         if abs(float(existing_value) - float(value)) > 0.01:  # Толерантность 0.01%
                             needs_update = True
-                            changed_fields[key] = value
-                            continue
+                            break
                     else:
                         # Для текстовых полей сравниваем NULL и строки
                         existing_str = str(existing_value).strip() if existing_value is not None else None
@@ -597,25 +580,21 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                             # Если в базе NULL, а в новых данных есть значение - обновляем
                             if existing_value is None and new_str is not None and new_str != '':
                                 needs_update = True
-                                changed_fields[key] = new_str
                                 st.info(f"🔄 Обновление {email}: добавление версии программы '{new_str}'")
-                                continue
+                                break
                             # Если значения разные - обновляем
                             elif existing_str != new_str:
                                 needs_update = True
-                                changed_fields[key] = new_str
                                 st.info(f"🔄 Обновление {email}: изменение версии с '{existing_str}' на '{new_str}'")
-                                continue
+                                break
                         else:
                             if existing_str != new_str:
                                 needs_update = True
-                                changed_fields[key] = new_str
-                                continue
+                                break
                 
                 if needs_update:
-                    # Обновляем только изменённые поля
-                    changed_fields['id'] = existing_record['id']
-                    records_to_update.append(changed_fields)
+                    new_record['id'] = existing_record['id']  # Добавляем ID для обновления
+                    records_to_update.append(new_record)
                 else:
                     unchanged_count += 1
             else:
