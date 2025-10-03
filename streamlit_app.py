@@ -527,10 +527,18 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
             if not email or '@edu.hse.ru' not in email:
                 continue
             
-            # Пропускаем дубликаты в текущем наборе данных
+            # КРИТИЧЕСКИ ВАЖНО: Пропускаем дубликаты в текущем наборе данных
             if email in processed_emails:
+                st.warning(f"⚠️ Пропущен дубликат в текущих данных: {email}")
                 continue
             processed_emails.add(email)
+            
+            # КРИТИЧЕСКИ ВАЖНО: Проверяем существование в базе по ТОЧНОМУ email
+            email_exists_in_db = False
+            for existing_email in existing_data.keys():
+                if existing_email == email:
+                    email_exists_in_db = True
+                    break
             
             new_record = {
                 'фио': str(row.get('ФИО', 'Неизвестно')).strip() if pd.notna(row.get('ФИО')) and str(row.get('ФИО', '')).strip() else 'Неизвестно',
@@ -547,9 +555,21 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
             }
             
             # Проверяем, есть ли этот email в базе данных (существующие записи)
-            if email in existing_data:
+            if email_exists_in_db:
+                # Находим соответствующую запись в базе
+                existing_record = None
+                for existing_email, record in existing_data.items():
+                    if existing_email == email:
+                        existing_record = record
+                        break
+                
+                if existing_record is None:
+                    # Не нашли запись - рассматриваем как новую
+                    new_record['created_at'] = datetime.now().isoformat()
+                    records_to_insert.append(new_record)
+                    continue
+                
                 # Проверяем, изменились ли данные
-                existing_record = existing_data[email]
                 needs_update = False
                 
                 # Сравниваем ключевые поля
