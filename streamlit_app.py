@@ -11,6 +11,7 @@ import tempfile
 import time
 from io import StringIO
 from datetime import datetime
+from separated_db_functions import upload_students_to_supabase, upload_all_courses_to_supabase
 
 # Page configuration
 st.set_page_config(
@@ -328,8 +329,57 @@ def extract_course_data(uploaded_file, course_name):
         completed_columns = []
         timestamp_columns = []
         
+        # Колонки для исключения из анализа курса ЦГ (на основе анализа паттернов)
+        # ВАЖНО: Исключаем справочные материалы, спецификации, промо-контент и оставляем только учебные задания
+        cg_excluded_keywords = [
+            # Справочные и информационные материалы
+            'take away', 'шпаргалка', 'консультация', 'общая информация', 'промо-ролик',
+            'поддержка студентов', 'пояснение', 'случайный вариант для студентов с овз',
+            'материалы по модулю', 'копия',
+            
+            # Экзаменационные материалы и спецификации  
+            'демонстрационный вариант', 'спецификация', 'демо-версия',
+            'правила проведения независимого экзамена', 'порядок организации и проведения независимых экзаменов',
+            'интерактивный тренажер правил нэ', 'пересдачи в сентябре', 'незрячих и слабовидящих',
+            
+            # Проектные работы (не входят в основную программу)
+            'проекты с использование tei',
+            
+            # Тренировочные и обучающие материалы (не оцениваемые)
+            'тренировочный тест', 'ключевые принципы tei', 'базовые возможности tie',
+            'специальные модули tei', 'будут идентичными',
+            
+            # Опросы и анкеты (не оцениваемые)
+            'опрос', 'тест по модулю', 'анкета',
+            
+            # Системные и служебные колонки
+            'user information', 'страна', 'user_id', 'данные о пользователе'
+        ]
+        
+        # Подсчет статистики фильтрации для курса ЦГ
+        excluded_count = 0
+        included_count = 0
+        
         for col in df.columns:
             if col not in ['Unnamed: 0', email_column, 'Данные о пользователе', 'User information', 'Страна']:
+                # Для курса ЦГ проверяем список исключений
+                if course_name == 'ЦГ':
+                    should_exclude = False
+                    col_str = str(col).strip().lower()
+                    
+                    # Проверяем каждое ключевое слово для исключения
+                    for excluded_keyword in cg_excluded_keywords:
+                        if excluded_keyword.lower() in col_str:
+                            should_exclude = True
+                            excluded_count += 1
+                            # Не выводим информацию о каждой исключенной колонке
+                            break
+                    
+                    if should_exclude:
+                        continue
+                    # Не выводим информацию о каждой включенной колонке
+                    included_count += 1
+                
                 # Check if this column contains completion data
                 if not col.startswith('Unnamed:') and len(str(col).strip()) > 0:
                     # Sample some values to see if they contain "Выполнено" или "Не выполнено"
@@ -348,9 +398,17 @@ def extract_course_data(uploaded_file, course_name):
                             timestamp_columns.append(col)
                             break
         
+        # Сводная информация о фильтрации ЦГ
+        if course_name == 'ЦГ':
+            total_relevant_columns = excluded_count + included_count
+            st.success(f"📊 Фильтрация ЦГ: исключено {excluded_count} колонок, включено {included_count} колонок из {total_relevant_columns} проанализированных")
+        
         # If we found timestamp columns, use them for completion calculation
         if timestamp_columns:
-            st.info(f"Найдено {len(timestamp_columns)} столбцов с временными метками для курса {course_name}")
+            if course_name == 'ЦГ':
+                st.success(f"✅ Курс ЦГ: найдено {len(timestamp_columns)} столбцов с временными метками (исключены справочные материалы)")
+            else:
+                st.info(f"Найдено {len(timestamp_columns)} столбцов с временными метками для курса {course_name}")
             
             # Calculate completion percentage based on timestamps
             completion_data = []
@@ -498,7 +556,6 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
     """Инкрементальная загрузка данных в Supabase с прогресс-баром"""
     try:
         # Получаем существующие данные для сравнения
-        st.info("🔍 Проверка существующих данных в базе...")
         existing_result = supabase.table('course_analytics').select('*').execute()
         existing_data = {}
         
@@ -554,10 +611,8 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                 'процент_андан': float(row.get('Процент_Андан', 0.0)) if pd.notna(row.get('Процент_Андан')) and row.get('Процент_Андан') != '' else None
             }
             
-            # Отладочная информация для версии программы
+            # Отладочная информация для версии программы (только в случае ошибок)
             version_value = new_record.get('версия_образовательной_программы')
-            if version_value is not None and version_value != '':
-                st.info(f"🔍 Новая запись {email}: версия='{version_value}'")
             
             # Проверяем, есть ли этот email в базе данных (существующие записи)
             if email_exists_in_db:
@@ -600,9 +655,8 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                         existing_str = str(existing_value).strip() if existing_value is not None else None
                         new_str = str(value).strip() if value is not None else None
                         
-                        # Особое внимание к полю версия_образовательной_программы
+                        # Особое внимание к полю версия_образовательной_программы (отладка только при ошибках)
                         if key == 'версия_образовательной_программы':
-                            st.write(f"🔍 Отладка {email}: existing='{existing_value}', new='{new_str}'")
                             # Если в базе NULL или пустая строка, а в новых данных есть значение - обновляем
                             if (existing_value is None or existing_str is None or existing_str == '') and new_str is not None and new_str != '':
                                 needs_update = True
@@ -731,6 +785,21 @@ def main():
     # Sidebar for file uploads
     st.sidebar.header("📁 Загрузка файлов")
     
+    # Опция выбора структуры БД
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("💾 Структура базы данных")
+    use_separated_tables = st.sidebar.radio(
+        "Выберите структуру:",
+        ["Объединенная таблица", "Разделенные таблицы"],
+        index=1,  # По умолчанию разделенные
+        help="Разделенные таблицы: студенты отдельно, прогресс по курсам отдельно"
+    ) == "Разделенные таблицы"
+    
+    if use_separated_tables:
+        st.sidebar.info("🔄 Используются разделенные таблицы")
+    else:
+        st.sidebar.info("🔗 Используется объединенная таблица")
+    
     # File upload widgets
     student_file = st.sidebar.file_uploader(
         "Загрузить список студентов (Excel/CSV)",
@@ -843,29 +912,86 @@ def main():
                         st.stop()
                     st.success(f"✅ Данные консолидированы: {len(consolidated_data)} всего записей")
                     
-                    # Step 4: Show statistics
-                    st.info("📈 Генерация статистики...")
-                    stats_col1, stats_col2, stats_col3 = st.columns(3)
+                    # Step 4: Show summary statistics table
+                    st.info("📋 Генерация сводной статистики...")
                     
-                    for i, course_name in enumerate(course_names):
+                    # Создаем сводную таблицу
+                    summary_data = []
+                    for course_name in course_names:
                         col_name = f'Процент_{course_name}'
                         if col_name in consolidated_data.columns:
-                            avg_completion = consolidated_data[col_name].mean()
-                            students_100 = len(consolidated_data[consolidated_data[col_name] == 100.0])
-                            students_0 = len(consolidated_data[consolidated_data[col_name] == 0.0])
-                            
-                            with [stats_col1, stats_col2, stats_col3][i]:
-                                st.metric(
-                                    label=f"Курс {course_name}",
-                                    value=f"{avg_completion:.2f}%",
-                                    delta=f"100%: {students_100} | 0%: {students_0}"
-                                )
+                            course_data = consolidated_data[col_name].dropna()
+                            if len(course_data) > 0:
+                                avg_completion = course_data.mean()
+                                students_100 = len(course_data[course_data == 100.0])
+                                students_0 = len(course_data[course_data == 0.0])
+                                students_partial = len(course_data[(course_data > 0.0) & (course_data < 100.0)])
+                                total_students = len(course_data)
+                                
+                                # Добавляем разбивку по 10% диапазонам
+                                students_90_99 = len(course_data[(course_data >= 90.0) & (course_data < 100.0)])
+                                students_80_89 = len(course_data[(course_data >= 80.0) & (course_data < 90.0)])
+                                students_70_79 = len(course_data[(course_data >= 70.0) & (course_data < 80.0)])
+                                students_60_69 = len(course_data[(course_data >= 60.0) & (course_data < 70.0)])
+                                students_50_59 = len(course_data[(course_data >= 50.0) & (course_data < 60.0)])
+                                students_40_49 = len(course_data[(course_data >= 40.0) & (course_data < 50.0)])
+                                students_30_39 = len(course_data[(course_data >= 30.0) & (course_data < 40.0)])
+                                students_20_29 = len(course_data[(course_data >= 20.0) & (course_data < 30.0)])
+                                students_10_19 = len(course_data[(course_data >= 10.0) & (course_data < 20.0)])
+                                students_1_9 = len(course_data[(course_data > 0.0) & (course_data < 10.0)])
+                                
+                                summary_data.append({
+                                    'Курс': course_name,
+                                    'Студентов всего': total_students,
+                                    'Средний %': f"{avg_completion:.1f}%",
+                                    '100%': students_100,
+                                    '90-99%': students_90_99,
+                                    '80-89%': students_80_89,
+                                    '70-79%': students_70_79,
+                                    '60-69%': students_60_69,
+                                    '50-59%': students_50_59,
+                                    '40-49%': students_40_49,
+                                    '30-39%': students_30_39,
+                                    '20-29%': students_20_29,
+                                    '10-19%': students_10_19,
+                                    '1-9%': students_1_9,
+                                    '0%': students_0
+                                })
+                    
+                    if summary_data:
+                        summary_df = pd.DataFrame(summary_data)
+                        st.subheader("📋 Сводная таблица по курсам")
+                        st.table(summary_df)
+                        
+                        # Общая статистика
+                        total_students = len(consolidated_data)
+                        students_with_data = len(consolidated_data.dropna(subset=[f'Процент_{course_names[0]}', f'Процент_{course_names[1]}', f'Процент_{course_names[2]}'], how='all'))
+                        
+                        st.info(f"📊 Общая статистика: {total_students} студентов в списке, {students_with_data} с данными о прогрессе")
                     
                     # Step 5: Обновление базы данных Supabase
                     st.info("💾 Обновление базы данных Supabase...")
                     # Используем уже проверенное подключение
                     
-                    success = upload_to_supabase(supabase, consolidated_data)
+                    if use_separated_tables:
+                        # Используем 4 отдельные таблицы
+                        st.info("🔄 Загрузка в 4 отдельные таблицы...")
+                        
+                        # Загружаем студентов
+                        if not upload_students_to_supabase(supabase, student_list):
+                            st.error("❌ Не удалось загрузить студентов")
+                            st.stop()
+                        
+                        # Загружаем курсы
+                        if not upload_all_courses_to_supabase(supabase, course_data_list, course_names):
+                            st.error("❌ Не удалось загрузить курсы")
+                            st.stop()
+                        
+                        success = True
+                    else:
+                        # Используем объединенную таблицу
+                        success = upload_to_supabase(supabase, consolidated_data)
+                    
                     if success:
                         st.success("🎉 Вся обработка завершена успешно!")
                         st.balloons()
