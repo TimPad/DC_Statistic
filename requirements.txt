@@ -1,4 +1,5 @@
-streamlit
-pandas
-supabase
-openpyxl
+streamlit>=1.25.0
+pandas>=1.5.0
+supabase>=1.0.0
+openpyxl>=3.0.0
+chardet>=5.0.0
