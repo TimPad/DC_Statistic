@@ -88,9 +88,9 @@ def check_supabase_connection(supabase):
                 'версия_образовательной_программы': 'Тест',
                 'группа': 'Тест',
                 'курс': 'Тест',
-                'процент_завершения_ЦГ': 0.0,
-                'процент_завершения_Питон': 0.0,
-                'процент_завершения_андан': 0.0,
+                'процент_цг': 0.0,
+                'процент_питон': 0.0,
+                'процент_андан': 0.0,
                 'created_at': datetime.now().isoformat()
             }
             
@@ -162,9 +162,9 @@ def create_course_analytics_table(supabase):
             версия_образовательной_программы TEXT,
             группа TEXT,
             курс TEXT,
-            процент_завершения_ЦГ REAL DEFAULT 0.0,
-            процент_завершения_Питон REAL DEFAULT 0.0,
-            процент_завершения_андан REAL DEFAULT 0.0,
+            процент_цг REAL DEFAULT 0.0,
+            процент_питон REAL DEFAULT 0.0,
+            процент_андан REAL DEFAULT 0.0,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
         );
@@ -541,9 +541,9 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                 'версия_образовательной_программы': str(row.get('Версия образовательной программы', '')) if pd.notna(row.get('Версия образовательной программы')) and str(row.get('Версия образовательной программы', '')).strip() else None,
                 'группа': str(row.get('Группа', '')) if pd.notna(row.get('Группа')) and str(row.get('Группа', '')).strip() else None,
                 'курс': str(row.get('Курс', '')) if pd.notna(row.get('Курс')) and str(row.get('Курс', '')).strip() else None,
-                'процент_завершения_ЦГ': float(row.get('Процент_ЦГ', 0.0)) if pd.notna(row.get('Процент_ЦГ')) and row.get('Процент_ЦГ') != '' else None,
-                'процент_завершения_Питон': float(row.get('Процент_Питон', 0.0)) if pd.notna(row.get('Процент_Питон')) and row.get('Процент_Питон') != '' else None,
-                'процент_завершения_андан': float(row.get('Процент_Андан', 0.0)) if pd.notna(row.get('Процент_Андан')) and row.get('Процент_Андан') != '' else None,
+                'процент_цг': float(row.get('Процент_ЦГ', 0.0)) if pd.notna(row.get('Процент_ЦГ')) and row.get('Процент_ЦГ') != '' else None,
+                'процент_питон': float(row.get('Процент_Питон', 0.0)) if pd.notna(row.get('Процент_Питон')) and row.get('Процент_Питон') != '' else None,
+                'процент_андан': float(row.get('Процент_Андан', 0.0)) if pd.notna(row.get('Процент_Андан')) and row.get('Процент_Андан') != '' else None,
                 'updated_at': datetime.now().isoformat()
             }
             
@@ -716,7 +716,7 @@ def main():
                             st.warning(f"⚠️ В файле курса {course_name} не найден столбец с прогрессом. Будут подставлены пустые значения.")
                             placeholder = pd.DataFrame({
                                 'Корпоративная почта': student_list['Корпоративная почта'].astype(str).str.lower().str.strip(),
-                                f'Процент_завершения_{course_name}': [None] * len(student_list)
+                                f'Процент_{course_name}': [None] * len(student_list)
                             })
                             course_data = placeholder
                         course_data_list.append(course_data)
@@ -734,7 +734,7 @@ def main():
                     stats_col1, stats_col2, stats_col3 = st.columns(3)
                     
                     for i, course_name in enumerate(course_names):
-                        col_name = f'Процент_завершения_{course_name}'
+                        col_name = f'Процент_{course_name}'
                         if col_name in consolidated_data.columns:
                             avg_completion = consolidated_data[col_name].mean()
                             students_100 = len(consolidated_data[consolidated_data[col_name] == 100.0])
