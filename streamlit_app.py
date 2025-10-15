@@ -11,6 +11,7 @@ import tempfile
 import time
 from io import StringIO
 from datetime import datetime
+from separated_db_functions import upload_students_to_supabase, upload_all_courses_to_supabase
 
 # Page configuration
 st.set_page_config(
@@ -328,8 +329,57 @@ def extract_course_data(uploaded_file, course_name):
         completed_columns = []
         timestamp_columns = []
         
+        # Колонки для исключения из анализа курса ЦГ (на основе анализа паттернов)
+        # ВАЖНО: Исключаем справочные материалы, спецификации, промо-контент и оставляем только учебные задания
+        cg_excluded_keywords = [
+            # Справочные и информационные материалы
+            'take away', 'шпаргалка', 'консультация', 'общая информация', 'промо-ролик',
+            'поддержка студентов', 'пояснение', 'случайный вариант для студентов с овз',
+            'материалы по модулю', 'копия',
+            
+            # Экзаменационные материалы и спецификации  
+            'демонстрационный вариант', 'спецификация', 'демо-версия',
+            'правила проведения независимого экзамена', 'порядок организации и проведения независимых экзаменов',
+            'интерактивный тренажер правил нэ', 'пересдачи в сентябре', 'незрячих и слабовидящих',
+            
+            # Проектные работы (не входят в основную программу)
+            'проекты с использование tei',
+            
+            # Тренировочные и обучающие материалы (не оцениваемые)
+            'тренировочный тест', 'ключевые принципы tei', 'базовые возможности tie',
+            'специальные модули tei', 'будут идентичными',
+            
+            # Опросы и анкеты (не оцениваемые)
+            'опрос', 'тест по модулю', 'анкета',
+            
+            # Системные и служебные колонки
+            'user information', 'страна', 'user_id', 'данные о пользователе'
+        ]
+        
+        # Подсчет статистики фильтрации для курса ЦГ
+        excluded_count = 0
+        included_count = 0
+        
         for col in df.columns:
             if col not in ['Unnamed: 0', email_column, 'Данные о пользователе', 'User information', 'Страна']:
+                # Для курса ЦГ проверяем список исключений
+                if course_name == 'ЦГ':
+                    should_exclude = False
+                    col_str = str(col).strip().lower()
+                    
+                    # Проверяем каждое ключевое слово для исключения
+                    for excluded_keyword in cg_excluded_keywords:
+                        if excluded_keyword.lower() in col_str:
+                            should_exclude = True
+                            excluded_count += 1
+                            # Не выводим информацию о каждой исключенной колонке
+                            break
+                    
+                    if should_exclude:
+                        continue
+                    # Не выводим информацию о каждой включенной колонке
+                    included_count += 1
+                
                 # Check if this column contains completion data
                 if not col.startswith('Unnamed:') and len(str(col).strip()) > 0:
                     # Sample some values to see if they contain "Выполнено" или "Не выполнено"
@@ -348,9 +398,17 @@ def extract_course_data(uploaded_file, course_name):
                             timestamp_columns.append(col)
                             break
         
+        # Сводная информация о фильтрации ЦГ
+        if course_name == 'ЦГ':
+            total_relevant_columns = excluded_count + included_count
+            st.success(f"📊 Фильтрация ЦГ: исключено {excluded_count} колонок, включено {included_count} колонок из {total_relevant_columns} проанализированных")
+        
         # If we found timestamp columns, use them for completion calculation
         if timestamp_columns:
-            st.info(f"Найдено {len(timestamp_columns)} столбцов с временными метками для курса {course_name}")
+            if course_name == 'ЦГ':
+                st.success(f"✅ Курс ЦГ: найдено {len(timestamp_columns)} столбцов с временными метками (исключены справочные материалы)")
+            else:
+                st.info(f"Найдено {len(timestamp_columns)} столбцов с временными метками для курса {course_name}")
             
             # Calculate completion percentage based on timestamps
             completion_data = []
@@ -495,16 +553,29 @@ def consolidate_data(student_list, course_data_list, course_names):
         return None
 
 def upload_to_supabase(supabase, data_df, batch_size=200):
-    """Простая загрузка данных в Supabase с использованием upsert"""
+    """Инкрементальная загрузка данных в Supabase с прогресс-баром"""
     try:
-        st.info("🔄 Подготовка данных для загрузки...")
+        # Получаем существующие данные для сравнения
+        existing_result = supabase.table('course_analytics').select('*').execute()
+        existing_data = {}
         
-        # Подготавливаем все записи для upsert
-        records_to_upsert = []
+        # Создаем словарь существующих записей по email
+        if existing_result.data:
+            for record in existing_result.data:
+                email = record.get('корпоративная_почта', '').lower().strip()
+                if email:
+                    existing_data[email] = record
+        
+        st.success(f"✅ Найдено {len(existing_data)} существующих записей")
+        
+        # Подготавливаем данные для обновления
+        records_to_insert = []
+        records_to_update = []
+        unchanged_count = 0
         processed_emails = set()  # Отслеживаем обработанные email для избежания дубликатов
         
         for _, row in data_df.iterrows():
-            # Используем правильное название колонки email
+            # Используем правильное название колонки email из памяти проекта
             email = str(row.get('Корпоративная почта', '')).strip().lower()
             if not email:  # Пробуем альтернативное название
                 email = str(row.get('Адрес электронной почты', '')).strip().lower()
@@ -513,28 +584,22 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
             if not email or '@edu.hse.ru' not in email:
                 continue
             
-            # Пропускаем дубликаты в текущем наборе данных
+            # КРИТИЧЕСКИ ВАЖНО: Пропускаем дубликаты в текущем наборе данных
             if email in processed_emails:
+                st.warning(f"⚠️ Пропущен дубликат в текущих данных: {email}")
                 continue
             processed_emails.add(email)
             
-            # Гарантируем ненулевое ФИО: берем из данных, иначе формируем из email
-            raw_name = row.get('ФИО')
-            name_str = ''
-            if pd.notna(raw_name):
-                name_str = str(raw_name).strip()
-            if not name_str:
-                # Формируем из email (до @), заменяя разделители и нормализуя регистр
-                email_prefix = email.split('@')[0] if email else ''
-                normalized = email_prefix.replace('.', ' ').replace('_', ' ').strip()
-                name_str = normalized.title() if normalized else email
-            # На всякий случай исключаем None: БД требует NOT NULL
-            if name_str is None:
-                name_str = ''
-
-            record = {
-                'фио': name_str,
-                'корпоративная_почта': email,
+            # КРИТИЧЕСКИ ВАЖНО: Проверяем существование в базе по ТОЧНОМУ email
+            email_exists_in_db = False
+            for existing_email in existing_data.keys():
+                if existing_email == email:
+                    email_exists_in_db = True
+                    break
+            
+            new_record = {
+                'фио': str(row.get('ФИО', 'Неизвестно')).strip() if pd.notna(row.get('ФИО')) and str(row.get('ФИО', '')).strip() else 'Неизвестно',
+                'корпоративная_почта': email if email else None,
                 'филиал_кампус': str(row.get('Филиал (кампус)', '')) if pd.notna(row.get('Филиал (кампус)')) and str(row.get('Филиал (кампус)', '')).strip() else None,
                 'факультет': str(row.get('Факультет', '')) if pd.notna(row.get('Факультет')) and str(row.get('Факультет', '')).strip() else None,
                 'образовательная_программа': str(row.get('Образовательная программа', '')) if pd.notna(row.get('Образовательная программа')) and str(row.get('Образовательная программа', '')).strip() else None,
@@ -543,64 +608,174 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                 'курс': str(row.get('Курс', '')) if pd.notna(row.get('Курс')) and str(row.get('Курс', '')).strip() else None,
                 'процент_цг': float(row.get('Процент_ЦГ', 0.0)) if pd.notna(row.get('Процент_ЦГ')) and row.get('Процент_ЦГ') != '' else None,
                 'процент_питон': float(row.get('Процент_Питон', 0.0)) if pd.notna(row.get('Процент_Питон')) and row.get('Процент_Питон') != '' else None,
-                'процент_андан': float(row.get('Процент_Андан', 0.0)) if pd.notna(row.get('Процент_Андан')) and row.get('Процент_Андан') != '' else None,
-                'updated_at': datetime.now().isoformat()
+                'процент_андан': float(row.get('Процент_Андан', 0.0)) if pd.notna(row.get('Процент_Андан')) and row.get('Процент_Андан') != '' else None
             }
             
-            records_to_upsert.append(record)
+            # Отладочная информация для версии программы (только в случае ошибок)
+            version_value = new_record.get('версия_образовательной_программы')
+            
+            # Проверяем, есть ли этот email в базе данных (существующие записи)
+            if email_exists_in_db:
+                # Находим соответствующую запись в базе
+                existing_record = None
+                for existing_email, record in existing_data.items():
+                    if existing_email == email:
+                        existing_record = record
+                        break
+                
+                if existing_record is None:
+                    # Не нашли запись - рассматриваем как новую
+                    new_record['created_at'] = datetime.now().isoformat()
+                    records_to_insert.append(new_record)
+                    continue
+                
+                # Проверяем, изменились ли данные
+                needs_update = False
+                
+                # Сравниваем ключевые поля
+                for key, value in new_record.items():
+                    if key == 'корпоративная_почта':
+                        continue  # Пропускаем ключевое поле
+                    
+                    existing_value = existing_record.get(key)
+                    
+                    # Для числовых полей сравниваем с толерантностью
+                    if key.startswith('процент_'):
+                        # Сравниваем NULL значения
+                        if value is None and existing_value is None:
+                            continue
+                        if value is None or existing_value is None:
+                            needs_update = True
+                            break
+                        if abs(float(existing_value) - float(value)) > 0.01:  # Толерантность 0.01%
+                            needs_update = True
+                            break
+                    else:
+                        # Для текстовых полей сравниваем NULL и строки
+                        existing_str = str(existing_value).strip() if existing_value is not None else None
+                        new_str = str(value).strip() if value is not None else None
+                        
+                        # Особое внимание к полю версия_образовательной_программы (отладка только при ошибках)
+                        if key == 'версия_образовательной_программы':
+                            # Если в базе NULL или пустая строка, а в новых данных есть значение - обновляем
+                            if (existing_value is None or existing_str is None or existing_str == '') and new_str is not None and new_str != '':
+                                needs_update = True
+                                st.success(f"🔄 Обновление {email}: добавление версии программы '{new_str}'")
+                                break
+                            # Если значения разные - обновляем
+                            elif existing_str != new_str:
+                                needs_update = True
+                                st.success(f"🔄 Обновление {email}: изменение версии с '{existing_str}' на '{new_str}'")
+                                break
+                        else:
+                            if existing_str != new_str:
+                                needs_update = True
+                                break
+                
+                if needs_update:
+                    new_record['id'] = existing_record['id']  # Добавляем ID для обновления
+                    records_to_update.append(new_record)
+                else:
+                    unchanged_count += 1
+            else:
+                # Новая запись
+                new_record['created_at'] = datetime.now().isoformat()
+                records_to_insert.append(new_record)
         
-        st.success(f"✅ Подготовлено {len(records_to_upsert)} записей для загрузки")
+        st.info(f"📋 Анализ изменений: {len(records_to_insert)} новых, {len(records_to_update)} обновлений, {unchanged_count} без изменений")
         
-        if len(records_to_upsert) == 0:
-            st.warning("⚠️ Нет данных для загрузки")
+        if len(records_to_insert) == 0 and len(records_to_update) == 0:
+            st.success("✅ Никаких изменений не обнаружено. База данных актуальна.")
             return True
         
-        # Загружаем данные пакетами с использованием upsert
-        total_batches = ((len(records_to_upsert)-1) // batch_size) + 1
+        total_operations = len(records_to_insert) + len(records_to_update)
+        total_batches = ((total_operations-1) // batch_size) + 1
+        
         progress_bar = st.progress(0)
         status_text = st.empty()
         
         successful_operations = 0
+        current_operation = 0
         
-        st.info(f"🔄 Загрузка {len(records_to_upsert)} записей пакетами по {batch_size}...")
-        
-        for i in range(0, len(records_to_upsert), batch_size):
-            batch_num = i // batch_size + 1
-            batch_end = min(i + batch_size, len(records_to_upsert))
-            batch_data = records_to_upsert[i:batch_end]
+        # Обрабатываем новые записи
+        if records_to_insert:
+            st.info(f"➕ Добавление {len(records_to_insert)} новых записей...")
             
-            try:
-                status_text.text(f"Пакет {batch_num}/{total_batches}: записи {i+1}-{batch_end}")
+            for i in range(0, len(records_to_insert), batch_size):
+                batch_num = current_operation // batch_size + 1
+                batch_end = min(i + batch_size, len(records_to_insert))
+                batch_data = records_to_insert[i:batch_end]
                 
-                # Используем upsert - если запись существует, обновляется, если нет - создается
-                result = supabase.table('course_analytics').upsert(batch_data, on_conflict='корпоративная_почта').execute()
-                
-                if result.data:
-                    successful_operations += len(result.data)
-                
-                progress = (i + len(batch_data)) / len(records_to_upsert)
-                progress_bar.progress(progress)
-                
-                time.sleep(0.1)  # Небольшая пауза между пакетами
-                
-            except Exception as e:
-                error_msg = str(e)
-                if "row-level security policy" in error_msg.lower() or "42501" in error_msg:
-                    st.error(f"❌ Пакет {batch_num}: Ошибка Row Level Security")
-                    st.error("💡 Необходимо настроить RLS политики в Supabase. Отключите RLS или создайте политику разрешения.")
-                    return False
-                else:
-                    st.error(f"❌ Ошибка в пакете {batch_num}: {error_msg}")
+                try:
+                    status_text.text(f"Добавление пакета {batch_num}: записи {i+1}-{batch_end}")
+                    
+                    result = supabase.table('course_analytics').insert(batch_data).execute()
+                    
+                    if result.data:
+                        successful_operations += len(result.data)
+                    
+                    current_operation += len(batch_data)
+                    progress = current_operation / total_operations
+                    progress_bar.progress(progress)
+                    
+                    time.sleep(0.1)
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    if "row-level security policy" in error_msg.lower() or "42501" in error_msg:
+                        st.error(f"❌ Пакет {batch_num}: Ошибка Row Level Security")
+                        st.error("💡 Необходимо настроить RLS политики в Supabase. Отключите RLS или создайте политику разрешения.")
+                    elif "duplicate key value violates unique constraint" in error_msg.lower() or "23505" in error_msg:
+                        st.error(f"❌ Пакет {batch_num}: Ошибка дубликата ключа")
+                        st.error("💡 Обнаружены дубликаты email в базе. Проверьте исходные данные.")
+                        # Попытаемся обработать каждую запись индивидуально
+                        st.info("🔄 Попытка индивидуальной обработки записей...")
+                        individual_success = 0
+                        for record in batch_data:
+                            try:
+                                individual_result = supabase.table('course_analytics').insert([record]).execute()
+                                if individual_result.data:
+                                    individual_success += 1
+                            except Exception as individual_error:
+                                # Логируем ошибки для отдельных записей, но продолжаем
+                                pass
+                        if individual_success > 0:
+                            successful_operations += individual_success
+                            st.success(f"✅ Обработано индивидуально: {individual_success} записей")
+                    else:
+                        st.error(f"Не удалось добавить пакет {batch_num}: {error_msg}")
+                        return False
+        
+        # Обрабатываем обновления
+        if records_to_update:
+            st.info(f"🔄 Обновление {len(records_to_update)} существующих записей...")
+            
+            for record in records_to_update:
+                try:
+                    record_id = record.pop('id')  # Удаляем ID из данных обновления
+                    
+                    result = supabase.table('course_analytics').update(record).eq('id', record_id).execute()
+                    
+                    if result.data:
+                        successful_operations += 1
+                    
+                    current_operation += 1
+                    progress = current_operation / total_operations
+                    progress_bar.progress(progress)
+                    
+                    if current_operation % 10 == 0:  # Обновляем статус каждые 10 операций
+                        status_text.text(f"Обновлено записей: {current_operation - len(records_to_insert)}/{len(records_to_update)}")
+                    
+                except Exception as e:
+                    st.error(f"Не удалось обновить запись: {str(e)}")
                     return False
         
         progress_bar.progress(1.0)
-        status_text.text(f"✅ Загрузка завершена: {successful_operations} записей обработано")
-        
-        st.success("🎉 Все данные успешно загружены в Supabase!")
+        status_text.text(f"✅ Инкрементальное обновление завершено: {successful_operations} операций выполнено")
         return True
         
     except Exception as e:
-        st.error(f"❌ Ошибка загрузки в Supabase: {str(e)}")
+        st.error(f"Ошибка инкрементального обновления Supabase: {str(e)}")
         return False
 
 def main():
@@ -609,6 +784,21 @@ def main():
     
     # Sidebar for file uploads
     st.sidebar.header("📁 Загрузка файлов")
+    
+    # Опция выбора структуры БД
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("💾 Структура базы данных")
+    use_separated_tables = st.sidebar.radio(
+        "Выберите структуру:",
+        ["Объединенная таблица", "Разделенные таблицы"],
+        index=1,  # По умолчанию разделенные
+        help="Разделенные таблицы: студенты отдельно, прогресс по курсам отдельно"
+    ) == "Разделенные таблицы"
+    
+    if use_separated_tables:
+        st.sidebar.info("🔄 Используются разделенные таблицы")
+    else:
+        st.sidebar.info("🔗 Используется объединенная таблица")
     
     # File upload widgets
     student_file = st.sidebar.file_uploader(
@@ -711,14 +901,7 @@ def main():
                     for course_file, course_name in zip(course_files, course_names):
                         course_data = extract_course_data(course_file, course_name)
                         if course_data is None:
-                            # Если не удалось извлечь процент завершения, продолжаем обработку:
-                            # создаём плейсхолдер с email из списка студентов и NULL процентом
-                            st.warning(f"⚠️ В файле курса {course_name} не найден столбец с прогрессом. Будут подставлены пустые значения.")
-                            placeholder = pd.DataFrame({
-                                'Корпоративная почта': student_list['Корпоративная почта'].astype(str).str.lower().str.strip(),
-                                f'Процент_{course_name}': [None] * len(student_list)
-                            })
-                            course_data = placeholder
+                            st.stop()
                         course_data_list.append(course_data)
                         st.success(f"✅ Обработан курс {course_name}: {len(course_data)} записей")
                     
@@ -729,29 +912,86 @@ def main():
                         st.stop()
                     st.success(f"✅ Данные консолидированы: {len(consolidated_data)} всего записей")
                     
-                    # Step 4: Show statistics
-                    st.info("📈 Генерация статистики...")
-                    stats_col1, stats_col2, stats_col3 = st.columns(3)
+                    # Step 4: Show summary statistics table
+                    st.info("📋 Генерация сводной статистики...")
                     
-                    for i, course_name in enumerate(course_names):
+                    # Создаем сводную таблицу
+                    summary_data = []
+                    for course_name in course_names:
                         col_name = f'Процент_{course_name}'
                         if col_name in consolidated_data.columns:
-                            avg_completion = consolidated_data[col_name].mean()
-                            students_100 = len(consolidated_data[consolidated_data[col_name] == 100.0])
-                            students_0 = len(consolidated_data[consolidated_data[col_name] == 0.0])
-                            
-                            with [stats_col1, stats_col2, stats_col3][i]:
-                                st.metric(
-                                    label=f"Курс {course_name}",
-                                    value=f"{avg_completion:.2f}%",
-                                    delta=f"100%: {students_100} | 0%: {students_0}"
-                                )
+                            course_data = consolidated_data[col_name].dropna()
+                            if len(course_data) > 0:
+                                avg_completion = course_data.mean()
+                                students_100 = len(course_data[course_data == 100.0])
+                                students_0 = len(course_data[course_data == 0.0])
+                                students_partial = len(course_data[(course_data > 0.0) & (course_data < 100.0)])
+                                total_students = len(course_data)
+                                
+                                # Добавляем разбивку по 10% диапазонам
+                                students_90_99 = len(course_data[(course_data >= 90.0) & (course_data < 100.0)])
+                                students_80_89 = len(course_data[(course_data >= 80.0) & (course_data < 90.0)])
+                                students_70_79 = len(course_data[(course_data >= 70.0) & (course_data < 80.0)])
+                                students_60_69 = len(course_data[(course_data >= 60.0) & (course_data < 70.0)])
+                                students_50_59 = len(course_data[(course_data >= 50.0) & (course_data < 60.0)])
+                                students_40_49 = len(course_data[(course_data >= 40.0) & (course_data < 50.0)])
+                                students_30_39 = len(course_data[(course_data >= 30.0) & (course_data < 40.0)])
+                                students_20_29 = len(course_data[(course_data >= 20.0) & (course_data < 30.0)])
+                                students_10_19 = len(course_data[(course_data >= 10.0) & (course_data < 20.0)])
+                                students_1_9 = len(course_data[(course_data > 0.0) & (course_data < 10.0)])
+                                
+                                summary_data.append({
+                                    'Курс': course_name,
+                                    'Студентов всего': total_students,
+                                    'Средний %': f"{avg_completion:.1f}%",
+                                    '100%': students_100,
+                                    '90-99%': students_90_99,
+                                    '80-89%': students_80_89,
+                                    '70-79%': students_70_79,
+                                    '60-69%': students_60_69,
+                                    '50-59%': students_50_59,
+                                    '40-49%': students_40_49,
+                                    '30-39%': students_30_39,
+                                    '20-29%': students_20_29,
+                                    '10-19%': students_10_19,
+                                    '1-9%': students_1_9,
+                                    '0%': students_0
+                                })
+                    
+                    if summary_data:
+                        summary_df = pd.DataFrame(summary_data)
+                        st.subheader("📋 Сводная таблица по курсам")
+                        st.table(summary_df)
+                        
+                        # Общая статистика
+                        total_students = len(consolidated_data)
+                        students_with_data = len(consolidated_data.dropna(subset=[f'Процент_{course_names[0]}', f'Процент_{course_names[1]}', f'Процент_{course_names[2]}'], how='all'))
+                        
+                        st.info(f"📊 Общая статистика: {total_students} студентов в списке, {students_with_data} с данными о прогрессе")
                     
                     # Step 5: Обновление базы данных Supabase
                     st.info("💾 Обновление базы данных Supabase...")
                     # Используем уже проверенное подключение
                     
-                    success = upload_to_supabase(supabase, consolidated_data)
+                    if use_separated_tables:
+                        # Используем 4 отдельные таблицы
+                        st.info("🔄 Загрузка в 4 отдельные таблицы...")
+                        
+                        # Загружаем студентов
+                        if not upload_students_to_supabase(supabase, student_list):
+                            st.error("❌ Не удалось загрузить студентов")
+                            st.stop()
+                        
+                        # Загружаем курсы
+                        if not upload_all_courses_to_supabase(supabase, course_data_list, course_names):
+                            st.error("❌ Не удалось загрузить курсы")
+                            st.stop()
+                        
+                        success = True
+                    else:
+                        # Используем объединенную таблицу
+                        success = upload_to_supabase(supabase, consolidated_data)
+                    
                     if success:
                         st.success("🎉 Вся обработка завершена успешно!")
                         st.balloons()
@@ -801,4 +1041,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
