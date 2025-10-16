@@ -268,10 +268,14 @@ def load_student_list(uploaded_file):
                 result_df['Курс'] = parsed_data[2]
                 result_df['Группа'] = parsed_data[3]
         
-        # Add missing columns with empty values
+        # Add missing columns with appropriate default values
         for required_col in required_columns.keys():
             if required_col not in result_df.columns:
-                result_df[required_col] = ''
+                # For For FIO column, use a placeholder that will be handled properly later
+                if required_col == 'ФИО':
+                    result_df[required_col] = None  # Will be handled in upload function
+                else:
+                    result_df[required_col] = ''
         
         # Filter only students with edu.hse.ru email
         if 'Корпоративная почта' in result_df.columns:
@@ -598,7 +602,7 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                     break
             
             new_record = {
-                'фио': str(row.get('ФИО', 'Неизвестно')).strip() if pd.notna(row.get('ФИО')) and str(row.get('ФИО', '')).strip() else 'Неизвестно',
+                'фио': str(row.get('ФИО', '')).strip() if pd.notna(row.get('ФИО')) and str(row.get('ФИО', '')).strip() else None,
                 'корпоративная_почта': email if email else None,
                 'филиал_кампус': str(row.get('Филиал (кампус)', '')) if pd.notna(row.get('Филиал (кампус)')) and str(row.get('Филиал (кампус)', '')).strip() else None,
                 'факультет': str(row.get('Факультет', '')) if pd.notna(row.get('Факультет')) and str(row.get('Факультет', '')).strip() else None,
@@ -625,6 +629,15 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                 
                 if existing_record is None:
                     # Не нашли запись - рассматриваем как новую
+                    # Гарантируем ненулевое ФИО: берем из данных, иначе формируем из email
+                    if new_record['фио'] is None or new_record['фио'] == '':
+                        # Формируем из email (до @), заменяя разделители и нормализуя регистр
+                        email_prefix = email.split('@')[0] if email else ''
+                        normalized = email_prefix.replace('.', ' ').replace('_', ' ').strip()
+                        new_record['фио'] = normalized.title() if normalized else email
+                    # На всякий случай исключаем None: БД требует NOT NULL
+                    if new_record['фио'] is None:
+                        new_record['фио'] = email if email else 'Неизвестно'
                     new_record['created_at'] = datetime.now().isoformat()
                     records_to_insert.append(new_record)
                     continue
@@ -652,8 +665,8 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                             break
                     else:
                         # Для текстовых полей сравниваем NULL и строки
-                        existing_str = str(existing_value).strip() if existing_value is not None else None
-                        new_str = str(value).strip() if value is not None else None
+                        existing_str = str(existing_value).strip() if existing_value is not None and str(existing_value).strip() != 'nan' else None
+                        new_str = str(value).strip() if value is not None and str(value).strip() != 'nan' else None
                         
                         # Особое внимание к полю версия_образовательной_программы (отладка только при ошибках)
                         if key == 'версия_образовательной_программы':
@@ -667,6 +680,22 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                                 needs_update = True
                                 st.success(f"🔄 Обновление {email}: изменение версии с '{existing_str}' на '{new_str}'")
                                 break
+                        elif key == 'фио':
+                            # Для поля ФИО особая логика: если в базе уже есть значение, а в новых данных None или пусто, не обновляем
+                            # Если в базе None или пусто, а в новых данных есть значение - обновляем
+                            if (existing_value is None or existing_str is None or existing_str == '') and new_str is not None and new_str != '':
+                                needs_update = True
+                                # Не выводим сообщение для каждого обновления ФИО чтобы не засорять лог
+                                break
+                            # Если в базе есть значение, а в новых данных пусто - не обновляем
+                            elif (existing_value is not None and existing_str is not None and existing_str != '') and (new_str is None or new_str == ''):
+                                # Не обновляем - сохраняем существующее значение
+                                pass
+                            # Если оба значения есть и разные - обновляем
+                            elif existing_str != new_str and new_str is not None and new_str != '':
+                                needs_update = True
+                                # Не выводим сообщение для каждого обновления ФИО чтобы не засорять лог
+                                break
                         else:
                             if existing_str != new_str:
                                 needs_update = True
@@ -674,11 +703,27 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                 
                 if needs_update:
                     new_record['id'] = existing_record['id']  # Добавляем ID для обновления
+                    # Гарантируем ненулевое ФИО для обновляемых записей тоже
+                    if new_record['фио'] is None or new_record['фио'] == '':
+                        # Если обновляем и новое ФИО пустое, сохраняем существующее
+                        new_record['фио'] = existing_record.get('фио', email if email else 'Неизвестно')
+                    # На всякий случай исключаем None: БД требует NOT NULL
+                    if new_record['фио'] is None:
+                        new_record['фио'] = email if email else 'Неизвестно'
                     records_to_update.append(new_record)
                 else:
                     unchanged_count += 1
             else:
                 # Новая запись
+                # Гарантируем ненулевое ФИО: берем из данных, иначе формируем из email
+                if new_record['фио'] is None or new_record['фио'] == '':
+                    # Формируем из email (до @), заменяя разделители и нормализуя регистр
+                    email_prefix = email.split('@')[0] if email else ''
+                    normalized = email_prefix.replace('.', ' ').replace('_', ' ').strip()
+                    new_record['фио'] = normalized.title() if normalized else email
+                # На всякий случай исключаем None: БД требует NOT NULL
+                if new_record['фио'] is None:
+                    new_record['фио'] = email if email else 'Неизвестно'
                 new_record['created_at'] = datetime.now().isoformat()
                 records_to_insert.append(new_record)
         
