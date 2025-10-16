@@ -11,7 +11,6 @@ import tempfile
 import time
 from io import StringIO
 from datetime import datetime
-from separated_db_functions import upload_students_to_supabase, upload_all_courses_to_supabase
 
 # Page configuration
 st.set_page_config(
@@ -108,6 +107,7 @@ def check_supabase_connection(supabase):
             else:
                 st.error("❌ Не удалось записать тестовые данные")
                 return False
+                
                 
         except Exception as e:
             if "relation \"course_analytics\" does not exist" in str(e).lower():
@@ -526,18 +526,6 @@ def consolidate_data(student_list, course_data_list, course_names):
         
         # Проверяем наличие дубликатов
         initial_count = len(consolidated)
-        email_counts = consolidated['Корпоративная почта'].value_counts()
-        duplicates = email_counts[email_counts > 1]
-        
-        if len(duplicates) > 0:
-            st.warning(f"⚠️ Обнаружено {len(duplicates)} дубликатов email:")
-            # Показываем первые несколько дубликатов
-            duplicate_list = list(duplicates.index[:5])
-            for email in duplicate_list:
-                count = duplicates[email]
-                st.text(f"  - {email}: {count} записей")
-            if len(duplicates) > 5:
-                st.text(f"  ... и ещё {len(duplicates) - 5} дубликатов")
         
         # Удаляем дубликаты, оставляя первое вхождение
         consolidated = consolidated.drop_duplicates(subset=['Корпоративная почта'], keep='first')
@@ -546,7 +534,7 @@ def consolidate_data(student_list, course_data_list, course_names):
         removed_count = initial_count - final_count
         
         if removed_count > 0:
-            st.success(f"✅ Удалено {removed_count} дубликатов. Осталось {final_count} уникальных записей")
+            st.warning(f"⚠️ Удалено {removed_count} дубликатов. Осталось {final_count} уникальных записей")
         else:
             st.success(f"✅ Дубликаты не обнаружены. Всего {final_count} уникальных записей")
         
@@ -555,6 +543,72 @@ def consolidate_data(student_list, course_data_list, course_names):
     except Exception as e:
         st.error(f"Error consolidating data: {str(e)}")
         return None
+
+def compare_records(new_record, existing_record):
+    """Compare two records and determine if an update is needed"""
+    needs_update = False
+    update_reasons = []  # Track reasons for update (for debugging)
+    
+    # Сравниваем ключевые поля
+    for key, value in new_record.items():
+        if key == 'корпоративная_почта':
+            continue  # Пропускаем ключевое поле
+        
+        existing_value = existing_record.get(key)
+        
+        # Для числовых полей сравниваем с толерантностью
+        if key.startswith('процент_'):
+            # Сравниваем NULL значения
+            if value is None and existing_value is None:
+                continue
+            if value is None or existing_value is None:
+                needs_update = True
+                update_reasons.append(f"{key}: NULL значение изменилось")
+                break
+            if abs(float(existing_value) - float(value)) > 0.01:  # Толерантность 0.01%
+                needs_update = True
+                update_reasons.append(f"{key}: значение изменилось более чем на 0.01%")
+                break
+        else:
+            # Для текстовых полей сравниваем NULL и строки
+            existing_str = str(existing_value).strip() if existing_value is not None and str(existing_value).strip() != 'nan' else None
+            new_str = str(value).strip() if value is not None and str(value).strip() != 'nan' else None
+            
+            # Особое внимание к полю версия_образовательной_программы
+            if key == 'версия_образовательной_программы':
+                # Если в базе NULL или пустая строка, а в новых данных есть значение - обновляем
+                if (existing_value is None or existing_str is None or existing_str == '') and new_str is not None and new_str != '':
+                    needs_update = True
+                    update_reasons.append(f"{key}: добавление значения")
+                    break
+                # Если значения разные - обновляем
+                elif existing_str != new_str:
+                    needs_update = True
+                    update_reasons.append(f"{key}: значение изменилось")
+                    break
+            elif key == 'фио':
+                # Для поля ФИО особая логика: если в базе уже есть значение, а в новых данных None или пусто, не обновляем
+                # Если в базе None или пусто, а в новых данных есть значение - обновляем
+                if (existing_value is None or existing_str is None or existing_str == '') and new_str is not None and new_str != '':
+                    needs_update = True
+                    update_reasons.append(f"{key}: добавление ФИО")
+                    break
+                # Если в базе есть значение, а в новых данных пусто - не обновляем
+                elif (existing_value is not None and existing_str is not None and existing_str != '') and (new_str is None or new_str == ''):
+                    # Не обновляем - сохраняем существующее значение
+                    pass
+                # Если оба значения есть и разные - обновляем
+                elif existing_str != new_str and new_str is not None and new_str != '':
+                    needs_update = True
+                    update_reasons.append(f"{key}: ФИО изменилось")
+                    break
+            else:
+                if existing_str != new_str:
+                    needs_update = True
+                    update_reasons.append(f"{key}: значение изменилось")
+                    break
+    
+    return needs_update, update_reasons
 
 def upload_to_supabase(supabase, data_df, batch_size=200):
     """Инкрементальная загрузка данных в Supabase с прогресс-баром"""
@@ -577,6 +631,7 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
         records_to_update = []
         unchanged_count = 0
         processed_emails = set()  # Отслеживаем обработанные email для избежания дубликатов
+        duplicate_count = 0  # Счетчик дубликатов
         
         for _, row in data_df.iterrows():
             # Используем правильное название колонки email из памяти проекта
@@ -590,16 +645,12 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
             
             # КРИТИЧЕСКИ ВАЖНО: Пропускаем дубликаты в текущем наборе данных
             if email in processed_emails:
-                st.warning(f"⚠️ Пропущен дубликат в текущих данных: {email}")
+                duplicate_count += 1
                 continue
             processed_emails.add(email)
             
             # КРИТИЧЕСКИ ВАЖНО: Проверяем существование в базе по ТОЧНОМУ email
-            email_exists_in_db = False
-            for existing_email in existing_data.keys():
-                if existing_email == email:
-                    email_exists_in_db = True
-                    break
+            email_exists_in_db = email in existing_data
             
             new_record = {
                 'фио': str(row.get('ФИО', '')).strip() if pd.notna(row.get('ФИО')) and str(row.get('ФИО', '')).strip() else None,
@@ -615,17 +666,9 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                 'процент_андан': float(row.get('Процент_Андан', 0.0)) if pd.notna(row.get('Процент_Андан')) and row.get('Процент_Андан') != '' else None
             }
             
-            # Отладочная информация для версии программы (только в случае ошибок)
-            version_value = new_record.get('версия_образовательной_программы')
-            
             # Проверяем, есть ли этот email в базе данных (существующие записи)
             if email_exists_in_db:
-                # Находим соответствующую запись в базе
-                existing_record = None
-                for existing_email, record in existing_data.items():
-                    if existing_email == email:
-                        existing_record = record
-                        break
+                existing_record = existing_data[email]
                 
                 if existing_record is None:
                     # Не нашли запись - рассматриваем как новую
@@ -643,63 +686,7 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                     continue
                 
                 # Проверяем, изменились ли данные
-                needs_update = False
-                
-                # Сравниваем ключевые поля
-                for key, value in new_record.items():
-                    if key == 'корпоративная_почта':
-                        continue  # Пропускаем ключевое поле
-                    
-                    existing_value = existing_record.get(key)
-                    
-                    # Для числовых полей сравниваем с толерантностью
-                    if key.startswith('процент_'):
-                        # Сравниваем NULL значения
-                        if value is None and existing_value is None:
-                            continue
-                        if value is None or existing_value is None:
-                            needs_update = True
-                            break
-                        if abs(float(existing_value) - float(value)) > 0.01:  # Толерантность 0.01%
-                            needs_update = True
-                            break
-                    else:
-                        # Для текстовых полей сравниваем NULL и строки
-                        existing_str = str(existing_value).strip() if existing_value is not None and str(existing_value).strip() != 'nan' else None
-                        new_str = str(value).strip() if value is not None and str(value).strip() != 'nan' else None
-                        
-                        # Особое внимание к полю версия_образовательной_программы (отладка только при ошибках)
-                        if key == 'версия_образовательной_программы':
-                            # Если в базе NULL или пустая строка, а в новых данных есть значение - обновляем
-                            if (existing_value is None or existing_str is None or existing_str == '') and new_str is not None and new_str != '':
-                                needs_update = True
-                                st.success(f"🔄 Обновление {email}: добавление версии программы '{new_str}'")
-                                break
-                            # Если значения разные - обновляем
-                            elif existing_str != new_str:
-                                needs_update = True
-                                st.success(f"🔄 Обновление {email}: изменение версии с '{existing_str}' на '{new_str}'")
-                                break
-                        elif key == 'фио':
-                            # Для поля ФИО особая логика: если в базе уже есть значение, а в новых данных None или пусто, не обновляем
-                            # Если в базе None или пусто, а в новых данных есть значение - обновляем
-                            if (existing_value is None or existing_str is None or existing_str == '') and new_str is not None and new_str != '':
-                                needs_update = True
-                                # Не выводим сообщение для каждого обновления ФИО чтобы не засорять лог
-                                break
-                            # Если в базе есть значение, а в новых данных пусто - не обновляем
-                            elif (existing_value is not None and existing_str is not None and existing_str != '') and (new_str is None or new_str == ''):
-                                # Не обновляем - сохраняем существующее значение
-                                pass
-                            # Если оба значения есть и разные - обновляем
-                            elif existing_str != new_str and new_str is not None and new_str != '':
-                                needs_update = True
-                                # Не выводим сообщение для каждого обновления ФИО чтобы не засорять лог
-                                break
-                        else:
-                            if existing_str != new_str:
-                                needs_update = True
-                                break
+                needs_update, update_reasons = compare_records(new_record, existing_record)
                 
                 if needs_update:
                     new_record['id'] = existing_record['id']  # Добавляем ID для обновления
@@ -726,6 +713,10 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
                     new_record['фио'] = email if email else 'Неизвестно'
                 new_record['created_at'] = datetime.now().isoformat()
                 records_to_insert.append(new_record)
+        
+        # Логируем агрегированную информацию вместо множества отдельных сообщений
+        if duplicate_count > 0:
+            st.warning(f"⚠️ Пропущено {duplicate_count} дубликатов в текущих данных")
         
         st.info(f"📋 Анализ изменений: {len(records_to_insert)} новых, {len(records_to_update)} обновлений, {unchanged_count} без изменений")
         
@@ -823,6 +814,55 @@ def upload_to_supabase(supabase, data_df, batch_size=200):
         st.error(f"Ошибка инкрементального обновления Supabase: {str(e)}")
         return False
 
+def fetch_student_list_from_db(supabase):
+    """Fetch student list from general_list table in Supabase"""
+    try:
+        st.info("📚 Получение списка студентов из базы данных...")
+        
+        # Fetch data from general_list table
+        result = supabase.table('general_list').select('*').execute()
+        
+        if not result.data:
+            st.warning("⚠️ Таблица general_list пуста или не существует")
+            return None
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(result.data)
+        st.success(f"✅ Получено {len(df)} записей из таблицы general_list")
+        
+        # Map columns from general_list to required format
+        # Based on the structure we saw earlier:
+        column_mapping = {
+            'fio': 'ФИО',
+            'korporativnaya_pochta': 'Корпоративная почта',
+            'filial_kampus': 'Филиал (кампус)',
+            'fakultet': 'Факультет',
+            'obrazovatelnaya_programma': 'Образовательная программа',
+            'versiya_obrazovatelnoy_programmy': 'Версия образовательной программы',
+            'gruppa': 'Группа',
+            'kurs': 'Курс'
+        }
+        
+        # Create new DataFrame with required columns
+        result_df = pd.DataFrame()
+        for source_col, target_col in column_mapping.items():
+            if source_col in df.columns:
+                result_df[target_col] = df[source_col]
+            else:
+                result_df[target_col] = ''  # Add empty column if not found
+        
+        # Filter only students with edu.hse.ru email
+        if 'Корпоративная почта' in result_df.columns:
+            result_df = result_df[result_df['Корпоративная почта'].astype(str).str.contains('@edu.hse.ru', na=False)]
+            result_df['Корпоративная почта'] = pd.Series(result_df['Корпоративная почта']).astype(str).str.lower().str.strip()
+        
+        st.success(f"✅ Обработано {len(result_df)} студентов с корпоративными почтами")
+        return result_df
+        
+    except Exception as e:
+        st.error(f"Ошибка получения списка студентов из базы данных: {str(e)}")
+        return None
+
 def main():
     st.title("📊 Обработка аналитики курсов")
     st.markdown("Загрузите файлы и обработайте аналитику курсов автоматически с сохранением в Supabase")
@@ -830,27 +870,29 @@ def main():
     # Sidebar for file uploads
     st.sidebar.header("📁 Загрузка файлов")
     
-    # Опция выбора структуры БД
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("💾 Структура базы данных")
-    use_separated_tables = st.sidebar.radio(
-        "Выберите структуру:",
-        ["Объединенная таблица", "Разделенные таблицы"],
-        index=1,  # По умолчанию разделенные
-        help="Разделенные таблицы: студенты отдельно, прогресс по курсам отдельно"
-    ) == "Разделенные таблицы"
-    
-    if use_separated_tables:
-        st.sidebar.info("🔄 Используются разделенные таблицы")
-    else:
-        st.sidebar.info("🔗 Используется объединенная таблица")
-    
     # File upload widgets
-    student_file = st.sidebar.file_uploader(
-        "Загрузить список студентов (Excel/CSV)",
-        type=['xlsx', 'xls', 'csv'],
-        help="Загрузите Excel или CSV файл с информацией о студентах"
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📚 Список студентов")
+    
+    # Option to fetch student list from database or upload file
+    student_source = st.sidebar.radio(
+        "Источник списка студентов:",
+        ["Из базы данных (general_list)", "Загрузить файл"],
+        index=0,  # По умолчанию из базы данных
+        help="Выберите источник данных о студентах"
     )
+    
+    student_file = None  # Initialize the variable
+    
+    if student_source == "Из базы данных (general_list)":
+        st.sidebar.info("🔄 Список студентов будет загружен из таблицы general_list")
+        student_list_fetched = True
+    else:
+        student_file = st.sidebar.file_uploader(
+            "Загрузить список студентов (Excel/CSV)",
+            type=['xlsx', 'xls', 'csv'],
+            help="Загрузите Excel или CSV файл с информацией о студентах"
+        )
     
     st.sidebar.markdown("---")
     st.sidebar.subheader("Файлы курсов (CSV/Excel)")
@@ -879,18 +921,19 @@ def main():
     with col1:
         st.header("📋 Статус обработки")
         
-        # Check if all files are uploaded
+        # Check if all required files are uploaded or data is available
         files_uploaded = all([
-            student_file is not None,
             course_cg_file is not None,
             course_python_file is not None,
             course_analysis_file is not None
         ])
         
-        if not files_uploaded:
-            st.info("Пожалуйста, загрузите все необходимые файлы для начала обработки:")
+        student_data_available = (student_source == "Из базы данных (general_list)") or (student_file is not None)
+        
+        if not (student_data_available and files_uploaded):
+            st.info("Пожалуйста, выберите источник списка студентов и загрузите все необходимые файлы для начала обработки:")
             st.markdown("""
-            - ✅ Список студентов (Excel или CSV файл)
+            - ✅ Список студентов (из базы данных или загрузить файл)
             - ✅ Данные курса ЦГ (CSV или Excel файл)  
             - ✅ Данные курса Python (CSV или Excel файл)
             - ✅ Данные курса Анализ данных (CSV или Excel файл)
@@ -898,7 +941,7 @@ def main():
             
             # Show upload status
             file_status = {
-                "Список студентов": "✅" if student_file else "❌",
+                "Список студентов": "✅" if student_data_available else "❌",
                 "Курс ЦГ": "✅" if course_cg_file else "❌",
                 "Курс Python": "✅" if course_python_file else "❌",
                 "Курс Анализ данных": "✅" if course_analysis_file else "❌"
@@ -908,7 +951,7 @@ def main():
             st.table(status_df)
         
         else:
-            st.success("Все файлы успешно загружены! Готово к обработке.")
+            st.success("Все данные готовы к обработке!")
             
             if st.button("🚀 Начать обработку", type="primary"):
                 
@@ -932,7 +975,11 @@ def main():
                     
                     # Step 1: Load student list
                     st.info("📚 Загрузка списка студентов...")
-                    student_list = load_student_list(student_file)
+                    if student_source == "Из базы данных (general_list)":
+                        student_list = fetch_student_list_from_db(supabase)
+                    else:
+                        student_list = load_student_list(student_file)
+                    
                     if student_list is None:
                         st.stop()
                     st.success(f"✅ Загружено {len(student_list)} записей студентов")
@@ -1018,24 +1065,8 @@ def main():
                     st.info("💾 Обновление базы данных Supabase...")
                     # Используем уже проверенное подключение
                     
-                    if use_separated_tables:
-                        # Используем 4 отдельные таблицы
-                        st.info("🔄 Загрузка в 4 отдельные таблицы...")
-                        
-                        # Загружаем студентов
-                        if not upload_students_to_supabase(supabase, student_list):
-                            st.error("❌ Не удалось загрузить студентов")
-                            st.stop()
-                        
-                        # Загружаем курсы
-                        if not upload_all_courses_to_supabase(supabase, course_data_list, course_names):
-                            st.error("❌ Не удалось загрузить курсы")
-                            st.stop()
-                        
-                        success = True
-                    else:
-                        # Используем объединенную таблицу
-                        success = upload_to_supabase(supabase, consolidated_data)
+                    # Всегда используем объединенную таблицу (разделенные таблицы временно не поддерживаются)
+                    success = upload_to_supabase(supabase, consolidated_data)
                     
                     if success:
                         st.success("🎉 Вся обработка завершена успешно!")
