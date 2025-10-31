@@ -6,6 +6,8 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
 from io import StringIO
+import time
+from datetime import datetime
 
 # Page configuration
 st.set_page_config(
@@ -15,169 +17,171 @@ st.set_page_config(
 )
 
 # ==============================
-# НОВАЯ НЕЗАВИСИМАЯ ФУНКЦИЯ ОБНОВЛЕНИЯ ТАБЛИЦЫ STUDENTS
+# ФУНКЦИИ ДЛЯ РАБОТЫ С РАЗДЕЛЁННЫМИ ТАБЛИЦАМИ (встроены)
 # ==============================
-def update_students_table_in_supabase(supabase: Client, student_ pd.DataFrame):
+
+def upload_students_to_supabase(supabase, student_data):
     """
-    Обновляет только таблицу 'students' в Supabase.
-    Не связано с загрузкой данных курсов.
+    Загрузка данных студентов в таблицу students с использованием оптимизированного UPSERT
     """
-    if student_data is None or student_data.empty:
-        st.warning("⚠️ Нет данных для обновления таблицы студентов.")
-        return False
-
-    st.info("👥 Обновление таблицы 'students' в Supabase...")
-    records = []
-    seen_emails = set()
-
-    for _, row in student_data.iterrows():
-        email = str(row.get('Корпоративная почта', '')).strip().lower()
-        if not email or '@edu.hse.ru' not in email:
-            continue
-        if email in seen_emails:
-            continue
-        seen_emails.add(email)
-
-        record = {
-            'корпоративная_почта': email,
-            'фио': str(row.get('ФИО', '')).strip() or None,
-            'филиал_кампус': str(row.get('Филиал (кампус)', '')).strip() or None,
-            'факультет': str(row.get('Факультет', '')).strip() or None,
-            'образовательная_программа': str(row.get('Образовательная программа', '')).strip() or None,
-            'версия_образовательной_программы': str(row.get('Версия образовательной программы', '')).strip() or None,
-            'группа': str(row.get('Группа', '')).strip() or None,
-            'курс': str(row.get('Курс', '')).strip() or None,
-        }
-        records.append(record)
-
-    if not records:
-        st.warning("⚠️ После фильтрации не осталось валидных записей студентов.")
-        return False
-
-    # Получаем существующие email из таблицы students
     try:
-        existing = supabase.table('students').select('корпоративная_почта').execute()
-        existing_emails = {r['корпоративная_почта'].lower() for r in existing.data} if existing.data else set()
+        st.info("👥 Загрузка данных студентов (UPSERT)...")
+        records_for_upsert = []
+        processed_emails = set()
+        
+        for _, row in student_data.iterrows():
+            email = str(row.get('Корпоративная почта', '')).strip().lower()
+            if not email or '@edu.hse.ru' not in email:
+                continue
+            if email in processed_emails:
+                continue
+            processed_emails.add(email)
+                
+            student_record = {
+                'корпоративная_почта': email,
+                'фио': str(row.get('ФИО', 'Неизвестно')).strip() or 'Неизвестно',
+                'филиал_кампус': str(row.get('Филиал (кампус)', '')) if pd.notna(row.get('Филиал (кампус)')) and str(row.get('Филиал (кампус)', '')).strip() else None,
+                'факультет': str(row.get('Факультет', '')) if pd.notna(row.get('Факультет')) and str(row.get('Факультет', '')).strip() else None,
+                'образовательная_программа': str(row.get('Образовательная программа', '')) if pd.notna(row.get('Образовательная программа')) and str(row.get('Образовательная программа', '')).strip() else None,
+                'версия_образовательной_программы': str(row.get('Версия образовательной программы', '')) if pd.notna(row.get('Версия образовательной программы')) and str(row.get('Версия образовательной программы', '')).strip() else None,
+                'группа': str(row.get('Группа', '')) if pd.notna(row.get('Группа')) and str(row.get('Группа', '')).strip() else None,
+                'курс': str(row.get('Курс', '')) if pd.notna(row.get('Курс')) and str(row.get('Курс', '')).strip() else None,
+            }
+            records_for_upsert.append(student_record)
+        
+        if not records_for_upsert:
+            st.info("📋 Нет записей для обработки")
+            return True
+        
+        st.info(f"📋 Подготовлено {len(records_for_upsert)} записей для UPSERT")
+        batch_size = 200
+        total_processed = 0
+        
+        for i in range(0, len(records_for_upsert), batch_size):
+            batch = records_for_upsert[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = ((len(records_for_upsert) - 1) // batch_size) + 1
+            
+            try:
+                result = supabase.table('students').upsert(
+                    batch,
+                    on_conflict='корпоративная_почта',
+                    ignore_duplicates=False,
+                    returning='minimal'
+                ).execute()
+                total_processed += len(batch)
+                st.success(f"✅ Батч {batch_num}/{total_batches}: обработано {len(batch)} записей")
+            except Exception as e:
+                error_str = str(e)
+                if any(pat in error_str.lower() for pat in ["connection", "timeout", "ssl", "eof"]):
+                    st.warning(f"⚠️ Сетевая ошибка в батче {batch_num}, повтор...")
+                    time.sleep(2)
+                    try:
+                        result = supabase.table('students').upsert(batch, on_conflict='корпоративная_почта').execute()
+                        total_processed += len(batch)
+                        st.success(f"✅ Батч {batch_num} (после повтора)")
+                    except Exception as retry_error:
+                        st.error(f"❌ Батч {batch_num} не удался после повтора: {retry_error}")
+                        return False
+                else:
+                    st.error(f"❌ Ошибка в батче {batch_num}: {e}")
+                    return False
+        
+        st.success(f"🎉 UPSERT завершён! Обработано {total_processed} записей")
+        return True
     except Exception as e:
-        st.error(f"❌ Ошибка при чтении таблицы 'students': {e}")
+        st.error(f"❌ Критическая ошибка UPSERT студентов: {e}")
         return False
 
-    to_insert = []
-    to_update = []
 
-    for rec in records:
-        email = rec['корпоративная_почта']
-        if email in existing_emails:
-            to_update.append(rec)
-        else:
-            to_insert.append(rec)
-
-    success = True
-    batch_size = 200
-
-    if to_insert:
-        st.info(f"➕ Вставка {len(to_insert)} новых студентов...")
-        for i in range(0, len(to_insert), batch_size):
-            batch = to_insert[i:i + batch_size]
-            try:
-                supabase.table('students').upsert(batch, on_conflict='корпоративная_почта').execute()
-            except Exception as e:
-                st.error(f"❌ Ошибка вставки студентов: {e}")
-                success = False
-
-    if to_update:
-        st.info(f"🔄 Обновление {len(to_update)} студентов...")
-        for i in range(0, len(to_update), batch_size):
-            batch = to_update[i:i + batch_size]
-            try:
-                supabase.table('students').upsert(batch, on_conflict='корпоративная_почта').execute()
-            except Exception as e:
-                st.error(f"❌ Ошибка обновления студентов: {e}")
-                success = False
-
-    if success:
-        st.success(f"✅ Таблица 'students' обновлена: {len(records)} записей")
-    return success
-
-
-# ==============================
-# ФУНКЦИЯ ЗАГРУЗКИ КУРСОВ (БЕЗ СТУДЕНТОВ)
-# ==============================
-def upload_all_courses_to_supabase(supabase: Client, course_data_list, course_names):
-    """
-    Загружает данные курсов в соответствующие таблицы (course_cg, course_python, course_analysis).
-    Не затрагивает таблицу students.
-    """
-    table_mapping = {
-        'ЦГ': 'course_cg',
-        'Питон': 'course_python',
-        'Андан': 'course_analysis'
-    }
-
-    for course_data, course_name in zip(course_data_list, course_names):
+def upload_course_data_to_supabase(supabase, course_data, course_name):
+    """Загрузка данных одного курса в соответствующую таблицу"""
+    try:
+        table_mapping = {'ЦГ': 'course_cg', 'Питон': 'course_python', 'Андан': 'course_analysis'}
         table_name = table_mapping.get(course_name)
         if not table_name:
             st.error(f"❌ Неизвестный курс: {course_name}")
             return False
-
+            
+        st.info(f"📈 Загрузка курса {course_name} в {table_name}...")
         if course_data is None or course_data.empty:
             st.warning(f"⚠️ Нет данных для курса {course_name}")
-            continue
+            return True
 
-        st.info(f"📈 Загрузка данных курса {course_name} в таблицу {table_name}...")
-
-        records = []
-        seen_emails = set()
+        records_for_upsert = []
+        processed_emails = set()
         for _, row in course_data.iterrows():
             email = str(row.get('Корпоративная почта', '')).strip().lower()
             if not email or '@edu.hse.ru' not in email:
                 continue
-            if email in seen_emails:
+            if email in processed_emails:
                 continue
-            seen_emails.add(email)
-
+            processed_emails.add(email)
+            
             percent_col = f'Процент_{course_name}'
-            progress = row.get(percent_col)
-            if pd.isna(progress):
-                progress = None
-            else:
+            progress_value = None
+            if percent_col in row and pd.notna(row[percent_col]) and row[percent_col] != '':
                 try:
-                    progress = float(progress)
+                    progress_value = float(row[percent_col])
                 except (ValueError, TypeError):
-                    progress = None
-
-            records.append({
+                    progress_value = None
+            
+            records_for_upsert.append({
                 'корпоративная_почта': email,
-                'процент_завершения': progress
+                'процент_завершения': progress_value
             })
-
-        if not records:
-            st.info(f"📋 Нет валидных записей для курса {course_name}")
-            continue
+        
+        if not records_for_upsert:
+            st.info(f"📋 Нет записей для курса {course_name}")
+            return True
 
         batch_size = 200
-        for i in range(0, len(records), batch_size):
-            batch = records[i:i + batch_size]
+        total_processed = 0
+        for i in range(0, len(records_for_upsert), batch_size):
+            batch = records_for_upsert[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
             try:
                 supabase.table(table_name).upsert(batch, on_conflict='корпоративная_почта').execute()
+                total_processed += len(batch)
+                st.success(f"✅ Курс {course_name} - батч {batch_num}: {len(batch)} записей")
             except Exception as e:
-                st.error(f"❌ Ошибка загрузки курса {course_name}, пакет {i//batch_size + 1}: {e}")
+                st.error(f"❌ Ошибка загрузки курса {course_name}, батч {batch_num}: {e}")
                 return False
 
-        st.success(f"✅ Курс {course_name} загружен: {len(records)} записей")
+        st.success(f"🎉 Курс {course_name}: {total_processed} записей загружено")
+        return True
+    except Exception as e:
+        st.error(f"❌ Ошибка загрузки курса {course_name}: {e}")
+        return False
 
-    return True
+
+def upload_all_courses_to_supabase(supabase, course_data_list, course_names):
+    """Загрузка всех курсов в отдельные таблицы"""
+    try:
+        st.info("📚 Загрузка всех курсов...")
+        success_count = 0
+        for course_data, course_name in zip(course_data_list, course_names):
+            if upload_course_data_to_supabase(supabase, course_data, course_name):
+                success_count += 1
+        if success_count == len(course_names):
+            st.success(f"🎉 Все {success_count} курса загружены!")
+            return True
+        else:
+            st.error(f"❌ Загружено только {success_count} из {len(course_names)}")
+            return False
+    except Exception as e:
+        st.error(f"❌ Ошибка загрузки всех курсов: {e}")
+        return False
 
 
 # ==============================
-# АУТЕНТИФИКАЦИЯ SUPABASE
+# ОСТАЛЬНЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==============================
+
 def authenticate_supabase():
-    """Аутентификация с Supabase используя Streamlit secrets"""
     try:
         if not hasattr(st, 'secrets') or "supabase" not in st.secrets:
-            st.error("❌ Секреты Supabase не найдены в конфигурации Streamlit")
-            st.error("💡 Для развертывания настройте секреты SUPABASE_URL и SUPABASE_KEY")
+            st.error("❌ Секреты Supabase не найдены")
             return None
         supabase_url = st.secrets["supabase"]["url"]
         supabase_key = st.secrets["supabase"]["key"]
@@ -185,15 +189,11 @@ def authenticate_supabase():
         st.success("✅ Аутентификация Supabase успешна")
         return supabase
     except Exception as e:
-        st.error(f"❌ Ошибка аутентификации Supabase: {str(e)}")
+        st.error(f"❌ Ошибка аутентификации: {e}")
         return None
 
 
-# ==============================
-# ЗАГРУЗКА И ОБРАБОТКА ДАННЫХ
-# ==============================
 def load_student_list(uploaded_file):
-    """Load student list from uploaded Excel or CSV file"""
     try:
         file_name = uploaded_file.name.lower()
         if file_name.endswith(('.xlsx', '.xls')):
@@ -208,7 +208,7 @@ def load_student_list(uploaded_file):
                 except UnicodeDecodeError:
                     df = pd.read_csv(StringIO(content.decode('cp1251')))
         else:
-            st.error("Неподдерживаемый формат файла. Используйте Excel (.xlsx, .xls) или CSV (.csv)")
+            st.error("Неподдерживаемый формат файла")
             return None
 
         required_columns = {
@@ -256,12 +256,11 @@ def load_student_list(uploaded_file):
             result_df['Корпоративная почта'] = pd.Series(result_df['Корпоративная почта']).astype(str).str.lower().str.strip()
         return result_df
     except Exception as e:
-        st.error(f"Ошибка загрузки списка студентов: {str(e)}")
+        st.error(f"Ошибка загрузки списка студентов: {e}")
         return None
 
 
 def extract_course_data(uploaded_file, course_name):
-    """Extract email and completion percentage from uploaded course file"""
     try:
         file_name = uploaded_file.name.lower()
         if file_name.endswith(('.xlsx', '.xls')):
@@ -337,7 +336,7 @@ def extract_course_data(uploaded_file, course_name):
 
         if course_name == 'ЦГ':
             total_relevant_columns = excluded_count + included_count
-            st.success(f"📊 Фильтрация ЦГ: исключено {excluded_count} колонок, включено {included_count} колонок из {total_relevant_columns} проанализированных")
+            st.success(f"📊 Фильтрация ЦГ: исключено {excluded_count}, включено {included_count}")
 
         if timestamp_columns:
             completion_data = []
@@ -355,10 +354,10 @@ def extract_course_data(uploaded_file, course_name):
                             completed_tasks += 1
                 percentage = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
                 completion_data.append({'email': str(email_val).lower().strip(), 'percentage': percentage})
-            if completion_
+            if completion_data:
                 result_df = pd.DataFrame(completion_data)
                 result_df.columns = ['Корпоративная почта', f'Процент_{course_name}']
-                st.success(f"✅ Рассчитан процент завершения для {len(result_df)} студентов курса {course_name} на основе {len(timestamp_columns)} заданий")
+                st.success(f"✅ Рассчитан процент завершения для {len(result_df)} студентов курса {course_name}")
                 return result_df
             else:
                 st.warning(f"Не найдено данных о завершении для курса {course_name}")
@@ -381,7 +380,7 @@ def extract_course_data(uploaded_file, course_name):
                             completed_tasks += 1
                 percentage = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
                 completion_data.append({'email': str(email_val).lower().strip(), 'percentage': percentage})
-            if completion_
+            if completion_data:
                 result_df = pd.DataFrame(completion_data)
                 result_df.columns = ['Корпоративная почта', f'Процент_{course_name}']
                 st.success(f"✅ Рассчитан процент завершения для {len(result_df)} студентов курса {course_name}")
@@ -405,12 +404,11 @@ def extract_course_data(uploaded_file, course_name):
         course_data = course_data[email_series.str.contains('@edu.hse.ru', na=False)]
         return course_data
     except Exception as e:
-        st.error(f"Ошибка обработки данных курса {course_name}: {str(e)}")
+        st.error(f"Ошибка обработки данных курса {course_name}: {e}")
         return None
 
 
 def consolidate_data(student_list, course_data_list, course_names):
-    """Consolidate all course data with student list and deduplication"""
     try:
         consolidated = student_list.copy()
         for course_data, course_name in zip(course_data_list, course_names):
@@ -435,12 +433,12 @@ def consolidate_data(student_list, course_data_list, course_names):
         final_count = len(consolidated)
         removed_count = initial_count - final_count
         if removed_count > 0:
-            st.success(f"✅ Удалено {removed_count} дубликатов. Осталось {final_count} уникальных записей")
+            st.success(f"✅ Удалено {removed_count} дубликатов. Осталось {final_count} записей")
         else:
-            st.success(f"✅ Дубликаты не обнаружены. Всего {final_count} уникальных записей")
+            st.success(f"✅ Дубликаты не обнаружены. Всего {final_count} записей")
         return consolidated
     except Exception as e:
-        st.error(f"Error consolidating data: {str(e)}")
+        st.error(f"Error consolidating data: {e}")
         return None
 
 
@@ -451,32 +449,19 @@ def main():
     st.title("📊 Обработка аналитики курсов")
     st.markdown("Загрузите файлы и обработайте аналитику курсов автоматически с сохранением в Supabase")
 
-    # Sidebar for file uploads
+    # Sidebar
     st.sidebar.header("📁 Загрузка файлов")
-    st.sidebar.info("🔄 Используются разделенные таблицы")
+    st.sidebar.info("🔄 Используются разделённые таблицы")
 
     student_file = st.sidebar.file_uploader(
         "Загрузить список студентов (Excel/CSV)",
-        type=['xlsx', 'xls', 'csv'],
-        help="Загрузите Excel или CSV файл с информацией о студентах"
+        type=['xlsx', 'xls', 'csv']
     )
     st.sidebar.markdown("---")
-    st.sidebar.subheader("Файлы курсов (CSV/Excel)")
-    course_cg_file = st.sidebar.file_uploader(
-        "Загрузить данные курса ЦГ",
-        type=['csv', 'xlsx', 'xls'],
-        help="Загрузите CSV или Excel файл для курса Цифровая грамотность"
-    )
-    course_python_file = st.sidebar.file_uploader(
-        "Загрузить данные курса Python",
-        type=['csv', 'xlsx', 'xls'],
-        help="Загрузите CSV или Excel файл для курса Python"
-    )
-    course_analysis_file = st.sidebar.file_uploader(
-        "Загрузить данные курса Анализ данных",
-        type=['csv', 'xlsx', 'xls'],
-        help="Загрузите CSV или Excel файл для курса Анализ данных"
-    )
+    st.sidebar.subheader("Файлы курсов")
+    course_cg_file = st.sidebar.file_uploader("Курс ЦГ", type=['csv', 'xlsx', 'xls'])
+    course_python_file = st.sidebar.file_uploader("Курс Python", type=['csv', 'xlsx', 'xls'])
+    course_analysis_file = st.sidebar.file_uploader("Курс Анализ данных", type=['csv', 'xlsx', 'xls'])
 
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -488,7 +473,7 @@ def main():
             course_analysis_file is not None
         ])
         if not files_uploaded:
-            st.info("Пожалуйста, загрузите все необходимые файлы:")
+            st.info("Пожалуйста, загрузите все файлы:")
             file_status = {
                 "Список студентов": "✅" if student_file else "❌",
                 "Курс ЦГ": "✅" if course_cg_file else "❌",
@@ -498,7 +483,7 @@ def main():
             status_df = pd.DataFrame([{"Файл": k, "Статус": v} for k, v in file_status.items()])
             st.table(status_df)
         else:
-            st.success("Все файлы успешно загружены! Готово к обработке.")
+            st.success("Все файлы загружены! Готово к обработке.")
             if st.button("🚀 Начать обработку", type="primary"):
                 with st.spinner("Обработка данных..."):
                     supabase = authenticate_supabase()
@@ -510,7 +495,7 @@ def main():
                     student_list = load_student_list(student_file)
                     if student_list is None:
                         st.stop()
-                    st.success(f"✅ Загружено {len(student_list)} записей студентов")
+                    st.success(f"✅ Загружено {len(student_list)} записей")
 
                     st.info("📊 Обработка файлов курсов...")
                     course_names = ['ЦГ', 'Питон', 'Андан']
@@ -527,7 +512,7 @@ def main():
                     consolidated_data = consolidate_data(student_list, course_data_list, course_names)
                     if consolidated_data is None:
                         st.stop()
-                    st.success(f"✅ Данные консолидированы: {len(consolidated_data)} записей")
+                    st.success(f"✅ Консолидировано: {len(consolidated_data)} записей")
 
                     # Сводная статистика
                     st.info("📋 Генерация сводной статистики...")
@@ -548,23 +533,18 @@ def main():
                                     '100%': students_100,
                                     '0%': students_0
                                 })
-                    if summary_
+                    if summary_data:
                         summary_df = pd.DataFrame(summary_data)
                         st.subheader("📋 Сводная таблица по курсам")
                         st.table(summary_df)
 
-                    # ЗАГРУЗКА В SUPABASE — ТОЛЬКО РАЗДЕЛЁННЫЕ ТАБЛИЦЫ
-                    st.info("💾 Обновление базы данных Supabase...")
-                    # 🔹 Сначала — только студенты
-                    if not update_students_table_in_supabase(supabase, student_list):
-                        st.error("❌ Не удалось обновить таблицу 'students'")
-                        st.stop()
-                    # 🔹 Затем — только курсы
+                    # 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: ТОЛЬКО КУРСЫ!
+                    st.info("💾 Обновление данных курсов в Supabase...")
                     if not upload_all_courses_to_supabase(supabase, course_data_list, course_names):
-                        st.error("❌ Не удалось загрузить данные курсов")
+                        st.error("❌ Не удалось загрузить курсы")
                         st.stop()
 
-                    st.success("🎉 Вся обработка завершена успешно!")
+                    st.success("🎉 Обработка завершена успешно!")
                     st.balloons()
 
     with col2:
@@ -574,16 +554,29 @@ def main():
             if supabase:
                 st.success("✅ Подключение работает")
 
+        # 🔁 ОТДЕЛЬНАЯ КНОПКА ДЛЯ СТУДЕНТОВ
+        if student_file is not None:
+            if st.button("🔄 Обновить список студентов", type="secondary"):
+                with st.spinner("Обновление списка студентов..."):
+                    supabase = authenticate_supabase()
+                    if supabase is None:
+                        st.error("❌ Не удалось подключиться к Supabase")
+                    else:
+                        student_list = load_student_list(student_file)
+                        if student_list is not None:
+                            if upload_students_to_supabase(supabase, student_list):
+                                st.success("✅ Список студентов обновлён!")
+                            else:
+                                st.error("❌ Не удалось обновить список студентов")
+                        else:
+                            st.error("❌ Не удалось загрузить список студентов")
+
         st.markdown("---")
         st.markdown("""
-        **Системные требования:**
-        - Список студентов в формате Excel (.xlsx, .xls) или CSV (.csv)
-        - Данные курсов в формате CSV (.csv) или Excel (.xlsx, .xls)
-        - Настроенное подключение к Supabase
-        **Результат:**
-        - Таблица `students` обновляется отдельно
-        - Прогресс по курсам — в отдельных таблицах
-        - Нет дублирования логики
+        **Режим работы:**
+        - 🚀 **Начать обработку** → обновляет **только курсы**
+        - 🔄 **Обновить список студентов** → обновляет **только таблицу `students`**
+        - Нет объединённой таблицы
         """)
 
 if __name__ == "__main__":
